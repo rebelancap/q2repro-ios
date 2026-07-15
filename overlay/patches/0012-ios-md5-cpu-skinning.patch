@@ -1,0 +1,63 @@
+Subject: [overlay 0012] Enable MD5 CPU-skinning on ES 3.0 (no SSBO/TBO)
+
+ES 3.0 lacks CLIENT_VA (forces GPU lerp) and SSBO/TBO (no GPU skinning), so upstream
+disables MD5. Instead: use GPU lerp only when a skeleton path exists, else the existing
+CPU skeleton path (calc_skel_vert); and upload alias indices to the element buffer when
+!CLIENT_VA. Apply: patch -p1 -d vendor/q2repro < this
+
+diff --git a/src/refresh/mesh.c b/src/refresh/mesh.c
+index 2e7ed8c1..a5437ddd 100644
+--- a/src/refresh/mesh.c
++++ b/src/refresh/mesh.c
+@@ -438,6 +438,20 @@ static void uniform_mesh_color(float r, float g, float b, float a)
+     }
+ }
+ 
++// [iOS overlay] Route alias-model indices through the element buffer when the
++// profile lacks client vertex arrays (ES 3.0). Upstream's alias CPU path passes a
++// client-memory index pointer to qglDrawElements with no EBO bound — valid only
++// under CLIENT_VA. Uploading once per mesh (STREAM) and returning NULL makes the
++// CPU skeleton (MD5) + MD2 paths draw correctly on ES 3.0. Mirrors GL_DrawIndexed.
++static const uint16_t *bind_mesh_indices(const uint16_t *indices, int num_indices)
++{
++    if (gl_config.caps & QGL_CAP_CLIENT_VA)
++        return indices;
++    GL_BindBuffer(GL_ELEMENT_ARRAY_BUFFER, gl_static.index_buffer);
++    qglBufferData(GL_ELEMENT_ARRAY_BUFFER, num_indices * sizeof(indices[0]), indices, GL_STREAM_DRAW);
++    return NULL;
++}
++
+ static void draw_celshading(const uint16_t *indices, int num_indices)
+ {
+     if (celscale < 0.01f)
+@@ -650,6 +664,10 @@ static void draw_alias_mesh(const uint16_t *indices, int num_indices,
+ 
+     c.trisDrawn += num_indices / 3;
+ 
++    // [iOS overlay] Upload indices to the element buffer once (ES 3.0 has no client
++    // vertex arrays); all draws below then use the bound EBO. NULL under !CLIENT_VA.
++    indices = bind_mesh_indices(indices, num_indices);
++
+     // if the model was culled, just draw the shadow
+     if (drawshadow == SHADOW_ONLY) {
+         GL_LockArrays(num_verts);
+diff --git a/src/refresh/models.c b/src/refresh/models.c
+index a77980ac..22587a0a 100644
+--- a/src/refresh/models.c
++++ b/src/refresh/models.c
+@@ -1692,9 +1692,13 @@ void MOD_Init(void)
+     gl_gpulerp->flags &= ~CVAR_FILES;
+ 
+     if (!(gl_config.caps & QGL_CAP_CLIENT_VA)) {
+-        // MUST use GPU lerp if using core profile
++        // Core/ES profile: no client vertex arrays. Use GPU skeletal lerp only if a
++        // GPU skinning path (SSBO or buffer-texture) exists; otherwise fall to the
++        // CPU skeleton path (calc_skel_vert). This keeps MD5 enabled on ES 3.0
++        // (ANGLE-Metal), which has neither — the disable block below is guarded by
++        // use_gpu_lerp so it is skipped in the CPU case. [iOS overlay]
+         Q_assert(gl_static.use_shaders);
+-        gl_static.use_gpu_lerp = true;
++        gl_static.use_gpu_lerp = (gl_config.caps & QGL_CAP_SKELETON_MASK) != 0;
+     } else if (gl_static.use_shaders) {
+         // restrict `auto' to GL 4.3 and higher
+         int minval = 1 + !(gl_config.caps & QGL_CAP_SHADER_STORAGE);

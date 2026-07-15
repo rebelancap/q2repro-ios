@@ -1,0 +1,61 @@
+// Q2REPRO_IOS_ACTION_MENU_V7
+// Themed menu for Action Quake II (aq2-tng). Installed to Documents/action/q2repro.menu,
+// where it fully shadows the base menu whenever fs_game=action (loaded live by UI_Reload
+// after `game_apply action`). Clean, title-only like Fable — NO banner/plaque. Sub-screens
+// are defined here since this file fully replaces the base menu while Action is active.
+
+background black
+font conchars
+cursor ch1
+
+begin main
+    title "ACTION"
+    action "server browser"   pushmenu multiplayer
+    action "player setup"     pushmenu players
+    action "iOS settings"     pushmenu ios
+    action "controls"         pushmenu keys
+    blank
+    action "back to Quake II" "game_apply baseq2; forcemenuoff; d1"
+    action "quit"             quit
+end
+
+begin multiplayer
+    title "Action Servers"
+    action "server browser"       pushmenu servers "favorites://" "broadcast://" "+http://q2servers.com/?raw=2"
+    action "address book"         pushmenu servers "favorites://" "file:///servers.lst" "broadcast://"
+    action "player setup"         pushmenu players
+end
+
+begin keys
+    title "Controls"
+    bind "attack"        "+attack"
+    bind "next weapon"   "weapnext"
+    bind "prev weapon"   "weapprev"
+    bind "jump"          "+moveup"
+    bind "crouch"        "+movedown"
+    bind "reload"        "reload"
+    bind "special/knife" "weapon_special"
+    bind "grapple"       "+hook"
+end
+
+begin ios
+    title "iOS Settings"
+    pairs "refresh rate" ios_display_fps "native max" 0 "60 hz" 60
+    range "horiz sensitivity" ios_sens_x 1 6
+    range "vert sensitivity" ios_sens_y 1 6
+    toggle "invert look" ios_invert_y
+    range "gyro aim" ios_gyro 0 3
+    range "menu size" ui_scale 3 7
+    range "touch size" ios_touch_scale 0.7 1.4
+    range "touch opacity" ios_touch_alpha 0.4 1.5
+    toggle "lefty touch layout" ios_touch_lefty
+    toggle "fire haptics" ios_haptics
+    toggle "fps counter" ios_fps
+    toggle "always run" cl_run
+end
+
+begin quit
+    title "Quit"
+    action "back to Quake II" "game_apply baseq2; forcemenuoff; d1"
+    action "cancel"           popmenu
+end

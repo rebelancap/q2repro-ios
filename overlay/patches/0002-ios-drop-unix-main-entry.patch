@@ -1,0 +1,29 @@
+Subject: [overlay 0002] Drop the Unix main() entry on iOS
+
+src/unix/system.c defines int main() + the desktop while(!terminate) loop. On
+iOS the OS owns the run loop (UIApplicationMain in the app), so guard the Unix
+entry out on the whole iPhone-derived family — TARGET_OS_IPHONE covers iOS AND
+visionOS/tvOS (where TARGET_OS_IOS is 0), all of which use UIApplicationMain
+(kept on macOS/Linux). Pairs with the app's CADisplayLink driver (M2).
+
+Apply from vendor root:  patch -p1 -d vendor/q2repro < this
+diff --git a/src/unix/system.c b/src/unix/system.c
+index fdbcf292..c212ab61 100644
+--- a/src/unix/system.c
++++ b/src/unix/system.c
+@@ -552,6 +552,10 @@ const sys_getinstalledgamepath_func_t gamepath_funcs[] = {
+ };
+ 
+ 
++#if defined(__APPLE__)
++#include <TargetConditionals.h>
++#endif
++#if !(defined(__APPLE__) && TARGET_OS_IPHONE)
+ /*
+ =================
+ main
+@@ -595,3 +599,4 @@ int main(int argc, char **argv)
+ 
+     return EXIT_FAILURE; // never gets here
+ }
++#endif // !(__APPLE__ && TARGET_OS_IPHONE) — iOS/visionOS provide their own UIApplicationMain entry

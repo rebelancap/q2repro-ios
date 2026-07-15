@@ -1,0 +1,24 @@
+Subject: [overlay 0011] Soft-fail stale sfx handles instead of aborting
+
+A stale sfx handle during a latched fs_restart (demo/buffered msgs still decoding)
+hit Q_assert and aborted on device. Soft-fail. Apply: patch -p1 -d vendor/q2repro
+
+diff --git a/src/client/sound/main.c b/src/client/sound/main.c
+index 7d4c5738..485d12b0 100644
+--- a/src/client/sound/main.c
++++ b/src/client/sound/main.c
+@@ -296,7 +296,13 @@ sfx_t *S_SfxForHandle(qhandle_t hSfx)
+         return NULL;
+     }
+ 
+-    Q_assert(hSfx > 0 && hSfx <= num_sfx);
++    // A stale handle can arrive while a latched game/map change (fs_restart) has freed
++    // the sfx table but a demo / buffered server messages are still decoding. Soft-fail
++    // instead of aborting (an on-device-only failure mode; carried from the prior port).
++    if (hSfx < 0 || hSfx > num_sfx) {
++        Com_DPrintf("%s: stale sfx handle %d (num_sfx %d)\n", __func__, hSfx, num_sfx);
++        return NULL;
++    }
+     return &known_sfx[hSfx - 1];
+ }
+ 

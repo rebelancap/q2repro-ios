@@ -1,0 +1,37 @@
+Subject: [overlay 0016] Stereoscopic view offset for visionOS 3D
+
+Add cl_stereo_offset + V_SetStereoOffset(): shift the view origin sideways along
+cl.v_right (parallel cameras, no vertical parallax) just before R_RenderFrame. The
+immersive shell renders the frame once per eye with +/- half the eye separation to
+produce true stereo depth. 0 = mono (no effect on the iOS/2D builds).
+Apply: patch -p1 -d vendor/q2repro < this
+
+diff --git a/src/client/view.c b/src/client/view.c
+index 5d088ad8..dadde4d5 100644
+--- a/src/client/view.c
++++ b/src/client/view.c
+@@ -528,6 +528,12 @@ void V_FogParamsChanged(unsigned bits, unsigned color_bits, unsigned hf_start_co
+         cur->height.end.dist = params->height.end.dist;
+ }
+ 
++// [stereo overlay] Horizontal eye offset (world units along the view's right vector) applied to
++// the view origin just before the scene is rendered; 0 = mono. The visionOS 3D shell renders the
++// frame once per eye with +/- half the eye separation to produce true stereoscopic depth.
++float cl_stereo_offset;
++void V_SetStereoOffset(float offset) { cl_stereo_offset = offset; }
++
+ /*
+ ==================
+ V_RenderView
+@@ -566,6 +572,11 @@ void V_RenderView(void)
+         cl.refdef.vieworg[1] += 1.0f / 16;
+         cl.refdef.vieworg[2] += 1.0f / 16;
+ 
++        // [stereo overlay] shift the eye sideways for stereoscopic 3D (parallel cameras — same
++        // view angles, so no vertical parallax). cl.v_right is set by CL_AddEntities above.
++        if (cl_stereo_offset)
++            VectorMA(cl.refdef.vieworg, cl_stereo_offset, cl.v_right, cl.refdef.vieworg);
++
+         cl.refdef.x = scr.vrect.x;
+         cl.refdef.y = scr.vrect.y;
+         cl.refdef.width = scr.vrect.width;

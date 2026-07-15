@@ -1,0 +1,52 @@
+Subject: [overlay 0020] Stereo convergence — off-axis projection for the visionOS 3D eyes
+
+Overlay 0016 shifts vieworg along v_right per eye (parallel axes) but left the
+projection symmetric, putting zero-parallax at INFINITY: all geometry renders with
+crossed disparity, unbounded up close — the viewmodel became unfusable (perceived
+as the gun flicking between two positions as the brain alternates eyes). Add the
+matching horizontal projection-window skew so both frusta converge at
+cl_stereo_convergence ("Crosshair Distance", default 128 units): m[8] -=
+m[0]*offset/C in GL_Frustum, which covers the world AND the viewmodel gunfov
+frustum (m[0] carries reflect_x, keeping the left-handed weapon consistent).
+Same approach as vkQuake-ios patch 0010. Apply: patch -p1 -d vendor/q2repro < this
+
+--- a/src/client/view.c
++++ b/src/client/view.c
+@@ -548,6 +548,15 @@
+ float cl_stereo_offset;
+ void V_SetStereoOffset(float offset) { cl_stereo_offset = offset; }
+ 
++// [stereo overlay] Convergence distance C (world units): the depth whose points project
++// identically in both eyes — i.e. sit exactly ON the virtual screen. Nearer pops out,
++// farther recedes behind. Exposed to the user as "Crosshair Distance". The refresh reads
++// it in GL_Frustum to skew each eye's projection window (off-axis projection); without
++// that skew zero-parallax sits at INFINITY and every object renders with crossed
++// disparity — unfusable for near objects like the viewmodel (the "gun in two places").
++float cl_stereo_convergence = 128.0f;
++void V_SetStereoConvergence(float c) { cl_stereo_convergence = c < 1.0f ? 1.0f : c; }
++
+ /*
+ ==================
+ V_RenderView
+--- a/src/refresh/state.c
++++ b/src/refresh/state.c
+@@ -237,6 +237,19 @@
+         zfar = gl_static.world.size * 2;
+ 
+     Matrix_Frustum(fov_x, fov_y, reflect_x, znear, zfar, matrix);
++
++    // [stereo overlay] Off-axis convergence: the stereo eye offset shifts vieworg along
++    // v_right (view.c, parallel axes); this matching projection-window skew makes both
++    // frusta converge at cl_stereo_convergence, so a point at that depth has zero
++    // disparity (sits ON the virtual screen). m[8] is the horizontal window-shift term;
++    // m[0] (the x focal length, already reflect_x-signed) scales the skew, so the
++    // viewmodel's reflected left-hand frustum stays consistent. 0 offset = no-op (2D).
++    {
++        extern float cl_stereo_offset, cl_stereo_convergence;
++        if (cl_stereo_offset)
++            matrix[8] -= matrix[0] * cl_stereo_offset / cl_stereo_convergence;
++    }
++
+     gl_backend->load_matrix(GL_PROJECTION, matrix, gl_identity);
+ }
+ 

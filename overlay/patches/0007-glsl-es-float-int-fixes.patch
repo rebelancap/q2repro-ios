@@ -1,0 +1,40 @@
+Subject: [overlay 0007] Fix GLSL ES 3.00 float/int shader errors
+
+Apple's ES 3.00 GLSL compiler rejects float+int with no implicit conversion, and
+chokes on the f float-literal suffix. DLIGHT_CUTOFF (64->64.0) fixes the dynamic-
+lights shader (float radius + DLIGHT_CUTOFF); also drop f suffixes. Desktop GL 1.40
+accepted both, so upstream never hit this. Apply: patch -p1 -d vendor/q2repro < this
+
+diff --git a/src/refresh/shader.c b/src/refresh/shader.c
+index de2defac..bb2e9769 100644
+--- a/src/refresh/shader.c
++++ b/src/refresh/shader.c
+@@ -133,7 +133,7 @@ static void write_dynamic_light_block(sizebuf_t *buf)
+             vec4    cone;
+         };
+     )
+-    GLSF("#define DLIGHT_CUTOFF 64\n");
++    GLSF("#define DLIGHT_CUTOFF 64.0\n");   // float: ES 3.00 GLSL rejects float + int (no implicit conversion)
+     GLSF("layout(std140) uniform DynamicLights {\n");
+     GLSF("#define MAX_DLIGHTS " STRINGIFY(MAX_DLIGHTS) "\n");
+     GLSL(
+@@ -165,8 +165,8 @@ static void write_dynamic_lights(sizebuf_t *buf)
+             vec3 dir         = light_dir / max(dist, 1.0);
+             float lambert;
+             
+-            if (dlights[i].color.r < 0.0f)
+-                lambert = 1.0f;
++            if (dlights[i].color.r < 0.0)
++                lambert = 1.0;
+             else
+                 lambert = max(dot(v_norm, dir), 0.0);
+             vec3 result      = ((dlights[i].color.rgb * dlights[i].color.a) * len) * lambert;
+@@ -460,7 +460,7 @@ static void write_vertex_shader(sizebuf_t *buf, glStateBits_t bits)
+ static void write_gaussian_blur(sizebuf_t *buf)
+ {
+     float sigma = gl_static.bloom_sigma;
+-    int radius = min(sigma * 2 + 0.5f, MAX_RADIUS);
++    int radius = min(sigma * 2 + 0.5, MAX_RADIUS);
+     int samples = radius + 1;
+     int raw_samples = (radius * 2) + 1;
+     float offsets[MAX_RADIUS + 1];

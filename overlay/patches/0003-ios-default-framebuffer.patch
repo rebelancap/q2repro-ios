@@ -1,0 +1,87 @@
+Subject: [overlay 0003] Redirect present-to-screen framebuffer to app FBO (iOS EAGL)
+
+EAGL has no usable window-system framebuffer 0; the app provides an FBO whose
+color renderbuffer is the CAEAGLLayer drawable. Add gl_static.default_framebuffer
+(0 on desktop -> unchanged) + R_SetDefaultFramebuffer(), and bind it instead of 0
+at the 4 present-to-screen sites. Apply: patch -p1 -d vendor/q2repro < this
+
+diff --git a/inc/refresh/refresh.h b/inc/refresh/refresh.h
+index 564e2da7..a2b9cbf5 100644
+--- a/inc/refresh/refresh.h
++++ b/inc/refresh/refresh.h
+@@ -277,6 +277,7 @@ void    R_DrawFill32(int x, int y, int w, int h, color_t color);
+ void    R_BeginFrame(void);
+ void    R_EndFrame(void);
+ void    R_ModeChanged(int width, int height, int flags);
++void    R_SetDefaultFramebuffer(unsigned fbo);  // iOS: the app EAGL fbo that presents to screen
+ bool    R_VideoSync(void);
+ 
+ void    GL_ExpireDebugObjects(void);
+diff --git a/src/refresh/gl.h b/src/refresh/gl.h
+index ea6c4c5b..8788b60a 100644
+--- a/src/refresh/gl.h
++++ b/src/refresh/gl.h
+@@ -102,6 +102,7 @@ typedef struct {
+     } world;
+     GLuint          renderbuffer;
+     GLuint          framebuffers[FBO_COUNT];
++    GLuint          default_framebuffer;    // iOS EAGL: app framebuffer that presents to screen; 0 on desktop
+     GLuint          uniform_buffer;
+     GLuint          dlight_buffer;
+ #if USE_MD5
+diff --git a/src/refresh/main.c b/src/refresh/main.c
+index ad24623a..85973a3f 100644
+--- a/src/refresh/main.c
++++ b/src/refresh/main.c
+@@ -738,7 +738,7 @@ static void GL_DrawBloom(bool waterwarp)
+     }
+ 
+     // upscale & add
+-    qglBindFramebuffer(GL_FRAMEBUFFER, 0);
++    qglBindFramebuffer(GL_FRAMEBUFFER, gl_static.default_framebuffer);
+     GL_PostProcess(bits, glr.fd.x, glr.fd.y, glr.fd.width, glr.fd.height);
+ }
+ 
+@@ -867,7 +867,7 @@ void R_RenderFrame(const refdef_t *fd)
+     GL_DrawDebugObjects();
+ 
+     if (glr.framebuffer_bound) {
+-        qglBindFramebuffer(GL_FRAMEBUFFER, 0);
++        qglBindFramebuffer(GL_FRAMEBUFFER, gl_static.default_framebuffer);
+         glr.framebuffer_bound = false;
+     }
+ 
+@@ -1568,6 +1568,11 @@ void R_EndRegistration(void)
+ R_ModeChanged
+ ===============
+ */
++void R_SetDefaultFramebuffer(unsigned fbo)
++{
++    gl_static.default_framebuffer = fbo;
++}
++
+ void R_ModeChanged(int width, int height, int flags)
+ {
+     if (qglFenceSync)
+diff --git a/src/refresh/texture.c b/src/refresh/texture.c
+index 7d25f9e4..d8886029 100644
+--- a/src/refresh/texture.c
++++ b/src/refresh/texture.c
+@@ -1167,7 +1167,7 @@ static bool GL_CheckFramebufferStatus(bool check, const char *name)
+     if (status == GL_FRAMEBUFFER_COMPLETE)
+         return true;
+ 
+-    qglBindFramebuffer(GL_FRAMEBUFFER, 0);
++    qglBindFramebuffer(GL_FRAMEBUFFER, gl_static.default_framebuffer);
+     if (gl_showerrors->integer)
+         Com_EPrintf("%s framebuffer status %#x\n", name, status);
+ 
+@@ -1227,7 +1227,7 @@ bool GL_InitFramebuffers(void)
+ 
+     CHECK_FB(bloom_w, "FBO_BLUR_1");
+ 
+-    qglBindFramebuffer(GL_FRAMEBUFFER, 0);
++    qglBindFramebuffer(GL_FRAMEBUFFER, gl_static.default_framebuffer);
+ 
+     return true;
+ }

@@ -1,0 +1,37 @@
+name: ES3Probe
+options:
+  bundleIdPrefix: com.q2repro
+  deploymentTarget:
+    iOS: "15.0"
+  createIntermediateGroups: true
+targets:
+  ES3Probe:
+    type: application
+    platform: iOS
+    sources:
+      - Sources
+    info:
+      path: Sources/Info.plist
+      properties:
+        CFBundleDisplayName: ES3Probe
+        UILaunchScreen: {}
+        CADisableMinimumFrameDurationOnPhone: true
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        UIRequiredDeviceCapabilities: [arm64]
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationLandscapeRight
+          - UIInterfaceOrientationLandscapeLeft
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.q2repro.es3probe
+        DEVELOPMENT_TEAM: 57G8J46Z2T
+        CODE_SIGN_STYLE: Automatic
+        TARGETED_DEVICE_FAMILY: "1"
+        MARKETING_VERSION: "1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        GCC_WARN_ABOUT_DEPRECATED_FUNCTIONS: NO
+    dependencies:
+      - sdk: OpenGLES.framework
+      - sdk: QuartzCore.framework
+      - sdk: UIKit.framework

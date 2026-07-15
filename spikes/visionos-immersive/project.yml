@@ -1,0 +1,36 @@
+name: ImmersiveSpike
+options:
+  bundleIdPrefix: com.q2repro
+  deploymentTarget:
+    visionOS: "26.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    DEVELOPMENT_TEAM: 57G8J46Z2T
+    CODE_SIGN_STYLE: Automatic
+    PRODUCT_BUNDLE_IDENTIFIER: com.q2repro.immersivespike
+    GENERATE_INFOPLIST_FILE: YES
+    # REQUIRED for immersive: makes Xcode generate the UIApplicationSceneManifest so the
+    # SwiftUI ImmersiveSpace scene is registered — without it openImmersiveSpace returns .error.
+    INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
+    INFOPLIST_KEY_NSCameraUsageDescription: "Pose estimation for immersive rendering."
+    INFOPLIST_KEY_NSWorldSensingUsageDescription: "Head-pose tracking for immersive rendering."
+    TARGETED_DEVICE_FAMILY: "7"
+    SWIFT_VERSION: "5.0"
+    SWIFT_OBJC_BRIDGING_HEADER: Sources/Bridging.h
+    HEADER_SEARCH_PATHS:
+      - $(SRCROOT)/include        # vendored EGL/GLES3 headers (ANGLE)
+targets:
+  ImmersiveSpike:
+    type: application
+    platform: visionOS
+    sources:
+      - Sources
+    dependencies:
+      - sdk: Metal.framework
+      - framework: ../angle-prebuilt-visionos/libEGL.framework
+        embed: true
+        codeSign: true
+      - framework: ../angle-prebuilt-visionos/libGLESv2.framework
+        embed: true
+        codeSign: true

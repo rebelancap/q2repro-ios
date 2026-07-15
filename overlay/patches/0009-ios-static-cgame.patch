@@ -1,0 +1,38 @@
+Subject: [overlay 0009] Call statically-linked GetCGameAPI directly on iOS
+
+The rerelease client-game (cgame) module is dlsym'd from the game dll on desktop;
+on iOS it's statically linked, so call GetCGameAPI directly (like overlay 0006 for
+the server game). Apply: patch -p1 -d vendor/q2repro < this
+
+diff --git a/src/client/cgame.c b/src/client/cgame.c
+index 8775e349..28833bd8 100644
+--- a/src/client/cgame.c
++++ b/src/client/cgame.c
+@@ -17,6 +17,9 @@ with this program; if not, write to the Free Software Foundation, Inc.,
+ */
+ 
+ #include "client.h"
++#if defined(__APPLE__)
++#include <TargetConditionals.h>
++#endif
+ #include "cgame_classic.h"
+ #include "common/loc.h"
+ #include "common/gamedll.h"
+@@ -424,11 +427,17 @@ void CG_Load(const char* new_game, bool is_rerelease_server)
+ 
+         cgame_entry_t entry = NULL;
+         if (is_rerelease_server) {
++#if defined(__APPLE__) && TARGET_OS_IPHONE
++            // iOS: cgame is statically linked into the app (rerelease game module).
++            extern void *GetCGameAPI(void *import);
++            entry = (cgame_entry_t)GetCGameAPI;
++#else
+             if (cgame_library)
+                 Sys_FreeLibrary(cgame_library);
+             cgame_library = GameDll_Load();
+             if (cgame_library)
+                 entry = Sys_GetProcAddress(cgame_library, "GetCGameAPI");
++#endif
+         } else {
+             // if we're connected to a "classic" Q2PRO server, always use builtin cgame
+             entry = GetClassicCGameAPI;

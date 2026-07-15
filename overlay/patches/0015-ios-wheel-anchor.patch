@@ -1,0 +1,36 @@
+Subject: [overlay 0015] iOS: render weapon/item wheel centred on its touch button
+
+CL_iOS_SetWheelAnchor(ux,uy) stores a HUD-fraction anchor; CL_Wheel_Draw uses it as the
+wheel centre (instead of left/right-of-screen-centre) so the wheel appears under the
+finger and the touch cursor's origin is the button. patch -p1 -d vendor/q2repro < this
+
+diff --git a/src/client/wheel.c b/src/client/wheel.c
+index 2b6f8a4b..79e492af 100644
+--- a/src/client/wheel.c
++++ b/src/client/wheel.c
+@@ -19,6 +19,12 @@ with this program; if not, write to the Free Software Foundation, Inc.,
+ #include "client.h"
+ #include "common/loc.h"
+ 
++// [iOS overlay] When set (>= 0), draw the weapon/item wheel centred at this HUD-fraction anchor
++// (the touch button that opened it) instead of the default left/right-of-centre spot — so the
++// wheel appears under the finger and the touch cursor's origin is the button. -1 = default.
++static vec2_t cl_ios_wheel_anchor = { -1.f, -1.f };
++void CL_iOS_SetWheelAnchor(float ux, float uy) { cl_ios_wheel_anchor[0] = ux; cl_ios_wheel_anchor[1] = uy; }
++
+ /* Draw item/ammo count for carousel and weapons/items wheel.
+  * Notably, the count should be drawn a bit smaller than usual
+  * text, but never below 100% */
+@@ -538,6 +544,12 @@ void CL_Wheel_Draw(void)
+ 
+     int center_y = scr.hud_height / 2;
+ 
++    // [iOS overlay] centre the wheel on the touch button that opened it, if set.
++    if (cl_ios_wheel_anchor[0] >= 0.f) {
++        center_x = (int)(cl_ios_wheel_anchor[0] * scr.hud_width);
++        center_y = (int)(cl_ios_wheel_anchor[1] * scr.hud_height);
++    }
++
+     float t = 1.0f - cl.wheel.timer;
+     float tween = 0.5f - (cos((t * t) * M_PIf) * 0.5f);
+     float wheel_alpha = 1.0f - tween;

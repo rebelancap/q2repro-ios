@@ -1,0 +1,51 @@
+Subject: [overlay 0017] Play old-protocol demos without seek snapshots
+
+The original 1997 demos (demo1.dm2 etc., protocol 26) parse fine for playback, but
+q2proto has no server-side WRITER for old protocols, so the seek-acceleration
+snapshot context init fails and CL_PlayDemo_f killed playback with 'Couldn't init
+demo context: PROTOCOL NOT SUPPORTED'. Vanilla baseq2's attract loop and any
+classic demo hit this. Make the snapshot context optional: on init failure, warn
+and play the demo without snapshots (seeking falls back to re-reading).
+Apply: patch -p1 -d vendor/q2repro < this
+
+--- a/src/client/demo.c
++++ b/src/client/demo.c
+@@ -29,6 +29,11 @@
+ static cvar_t   *cl_demowait;
+ static cvar_t   *cl_demosuspendtoggle;
+ static cvar_t   *cl_demo_protocol_kex;
++
++// [old-demo overlay] Set at playback start when the seek-snapshot server-context could not
++// be created (old-protocol demo, e.g. the original 1997 demo1.dm2 = protocol 26): snapshots
++// are skipped for that demo, everything else plays normally.
++static bool     demo_snapshots_unavailable;
+ 
+ q2protoio_ioarg_t demo_q2protoio_ioarg = {.sz_write = &cls.demo.buffer};
+ 
+@@ -929,9 +934,14 @@
+     connect_info.version = cls.protocolVersion;
+     connect_info.q2pro_nctype = cls.netchan.type;
+     q2proto_error_t err = q2proto_init_servercontext(&cls.demo.q2proto_context, &cls.demo.server_info, &connect_info);
++    // [old-demo overlay] Old-protocol demos PARSE fine for playback (cs_remap_old above),
++    // but q2proto has no server-side WRITER for them, so the seek-acceleration snapshot
++    // context cannot be created. Don't kill playback over an optional feature — play the
++    // demo without snapshots.
++    demo_snapshots_unavailable = err != Q2P_ERR_SUCCESS;
+     if (err != Q2P_ERR_SUCCESS) {
+-        Com_Error(ERR_DISCONNECT, "Couldn't init demo context: %s", q2proto_error_string(err));
+-        return;
++        Com_WPrintf("Old-protocol demo: playing without seek snapshots (%s)\n",
++                    q2proto_error_string(err));
+     }
+     SZ_InitWrite(&cls.demo.buffer, demo_buffer, MAX_MSGLEN);
+     demo_q2protoio_ioarg.max_msg_len = MAX_MSGLEN;
+@@ -981,6 +991,9 @@
+     if (cl_demosnaps->integer <= 0)
+         return;
+ 
++    if (demo_snapshots_unavailable)   // [old-demo overlay] no writer for this demo's protocol
++        return;
++
+     if (cls.demo.frames_read < cls.demo.last_snapshot + cl_demosnaps->integer * BASE_FRAMERATE)
+         return;
+ 

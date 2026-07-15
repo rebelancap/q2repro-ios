@@ -1,0 +1,37 @@
+Subject: [overlay 0004] Register the native iOS video driver (EAGL or ANGLE)
+
+Add the iOS video driver to vid_drivers[] (guarded by __APPLE__ && TARGET_OS_IPHONE,
+which covers iOS AND visionOS — TARGET_OS_IOS alone is 0 on visionOS):
+vid_angle (ANGLE-Metal, default) when Q2_USE_ANGLE, else vid_ios (native EAGL).
+Apply: patch -p1 -d vendor/q2repro < this
+
+diff --git a/src/client/refresh.c b/src/client/refresh.c
+index f25edcfa..c6dae56f 100644
+--- a/src/client/refresh.c
++++ b/src/client/refresh.c
+@@ -239,7 +239,25 @@ extern const vid_driver_t   vid_x11;
+ extern const vid_driver_t   vid_sdl;
+ #endif
+ 
++#if defined(__APPLE__)
++#include <TargetConditionals.h>
++#endif
++#if defined(__APPLE__) && TARGET_OS_IPHONE
++#if defined(Q2_USE_ANGLE) && Q2_USE_ANGLE
++extern const vid_driver_t   vid_angle;
++#else
++extern const vid_driver_t   vid_ios;
++#endif
++#endif
++
+ static const vid_driver_t *const vid_drivers[] = {
++#if defined(__APPLE__) && TARGET_OS_IPHONE
++#if defined(Q2_USE_ANGLE) && Q2_USE_ANGLE
++    &vid_angle,
++#else
++    &vid_ios,
++#endif
++#endif
+ #ifdef _WIN32
+     &vid_win32wgl,
+ #endif

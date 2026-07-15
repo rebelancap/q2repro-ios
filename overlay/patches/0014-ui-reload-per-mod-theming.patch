@@ -1,0 +1,46 @@
+Subject: [overlay 0014] iOS menu: big default scale + live UI_Reload for per-mod theming
+
+UI_ModeChanged: default ui_scale=4 (CVAR_ARCHIVE) on iOS; user-tunable via 'menu size'.
+UI_Reload(): re-parse APPLICATION.menu + rebuild built-ins without GL reinit (per-mod theming).
+patch -p1 -d vendor/q2repro < this
+
+diff --git a/src/client/ui/ui.c b/src/client/ui/ui.c
+index 3de92685..9c9a6e30 100644
+--- a/src/client/ui/ui.c
++++ b/src/client/ui/ui.c
+@@ -580,7 +580,13 @@ static void ui_scale_changed(cvar_t *self)
+ 
+ void UI_ModeChanged(void)
+ {
++#if defined(__APPLE__) && TARGET_OS_IPHONE
++    // Phone screens: the auto-scale (~2 at native Retina res) leaves menu text and sliders
++    // far too small for touch. Default big (uis.scale = 1/4); user-tunable+persisted via "menu size".
++    ui_scale = Cvar_Get("ui_scale", "4", CVAR_ARCHIVE);
++#else
+     ui_scale = Cvar_Get("ui_scale", "0", 0);
++#endif
+     ui_scale->changed = ui_scale_changed;
+     UI_Resize();
+ }
+@@ -598,6 +604,21 @@ static void UI_FreeMenus(void)
+ }
+ 
+ 
++// [iOS overlay] Re-parse APPLICATION.menu and rebuild the built-in menus WITHOUT a
++// full vid/UI reinit. Used after game_apply switches the mod dir so a mod's shadowing
++// q2repro.menu (e.g. action/q2repro.menu) themes the menus live. Touches no GL state.
++void UI_Reload(void)
++{
++    if (!uis.initialized)
++        return;
++    UI_ForceMenuOff();
++    UI_FreeMenus();
++    UI_LoadScript();
++    M_Menu_PlayerConfig();
++    M_Menu_Servers();
++    M_Menu_Demos();
++}
++
+ /*
+ =================
+ UI_Init

@@ -1,0 +1,33 @@
+Subject: [overlay 0019] Key_GetBindingForKey — per-key binding lookup for the shell
+
+The shell must apply the rerelease default GAMEPAD layout to pad keys nothing has
+bound (a vanilla-pak install execs a 1997 default.cfg with no pad section — every
+pad button dead while the hardwired analog sticks work: the 2026-07-12 Vision Pro
+report). Binding through the console `bind` command would clobber user rebinds, so
+the shell needs to read a single key's live binding; keybindings[] is file-static
+and Key_GetBinding() is the reverse (binding->key) lookup. patch -p1 -d vendor/q2repro
+
+--- a/inc/client/keys.h
++++ b/inc/client/keys.h
+@@ -167,3 +167,4 @@
+ 
+ void    Key_WaitKey(keywaitcb_t wait, void *arg);
+ bool    Key_IsWaiting(void);   // [iOS overlay] pad-rebind capture state
++const char *Key_GetBindingForKey(int keynum);   // [iOS overlay] "" when unbound
+--- a/src/client/keys.c
++++ b/src/client/keys.c
+@@ -925,4 +925,14 @@
+ bool Key_IsWaiting(void)
+ {
+     return key_wait_cb != NULL;
++}
++
++// [iOS overlay] Binding text for one key ("" when unbound). Lets the shell apply the
++// rerelease default GAMEPAD layout only to keys nothing has bound — a vanilla-pak
++// install execs a 1997 default.cfg with no pad section, leaving every pad key dead.
++const char *Key_GetBindingForKey(int keynum)
++{
++    if (keynum < 0 || keynum > 255 || !keybindings[keynum])
++        return "";
++    return keybindings[keynum];
+ }

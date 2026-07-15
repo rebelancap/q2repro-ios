@@ -1,0 +1,33 @@
+Subject: [overlay 0010] Register native CoreAudio snddma driver on iOS
+
+Add snddma_coreaudio (app/Sources/snddma_coreaudio.m, RemoteIO AudioUnit) to the
+DMA sound driver table on iOS. Apply: patch -p1 -d vendor/q2repro < this
+
+diff --git a/src/client/sound/dma.c b/src/client/sound/dma.c
+index 4aac32e4..d86f6840 100644
+--- a/src/client/sound/dma.c
++++ b/src/client/sound/dma.c
+@@ -528,6 +528,13 @@ extern const snddma_driver_t    snddma_wave;
+ extern const snddma_driver_t    snddma_sdl;
+ #endif
+ 
++#if defined(__APPLE__)
++#include <TargetConditionals.h>
++#endif
++#if defined(__APPLE__) && TARGET_OS_IPHONE
++extern const snddma_driver_t    snddma_coreaudio;   // native RemoteIO backend (app/Sources)
++#endif
++
+ static const snddma_driver_t *const s_drivers[] = {
+ #ifdef _WIN32
+     &snddma_dsound,
+@@ -535,6 +542,9 @@ static const snddma_driver_t *const s_drivers[] = {
+ #endif
+ #if USE_SDL
+     &snddma_sdl,
++#endif
++#if defined(__APPLE__) && TARGET_OS_IPHONE
++    &snddma_coreaudio,
+ #endif
+     NULL
+ };

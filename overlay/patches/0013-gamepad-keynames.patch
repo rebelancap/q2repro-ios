@@ -1,0 +1,85 @@
+Subject: [overlay 0013] Gamepad virtual keys + Key_IsWaiting (KEX bind support)
+
+Add KEX gamepad keycodes 214-229 (a_button..dpad_right) + names so the rerelease
+default.cfg controller layout (incl. +wheel) binds unmodified; Key_IsWaiting() lets
+the app send raw pad keys during keys-menu bind capture. patch -p1 -d vendor/q2repro
+
+diff --git a/inc/client/keys.h b/inc/client/keys.h
+index f76a5c43..118cda86 100644
+--- a/inc/client/keys.h
++++ b/inc/client/keys.h
+@@ -112,6 +112,28 @@ with this program; if not, write to the Free Software Foundation, Inc.,
+ #define K_MWHEELLEFT    213
+ #define K_MOUSELAST     213
+ 
++// gamepad buttons generate virtual keys, named to match the KEX rerelease
++// default.cfg binds (a_button, right_trigger, dpad_up, ...) so the shipped
++// controller layout — weapon wheel included — binds unmodified. [iOS overlay]
++#define K_GAMEPAD_FIRST  214
++#define K_A_BUTTON       214
++#define K_B_BUTTON       215
++#define K_X_BUTTON       216
++#define K_Y_BUTTON       217
++#define K_LEFT_SHOULDER  218
++#define K_RIGHT_SHOULDER 219
++#define K_LEFT_TRIGGER   220
++#define K_RIGHT_TRIGGER  221
++#define K_LEFT_STICK     222
++#define K_RIGHT_STICK    223
++#define K_START_BUTTON   224
++#define K_BACK_BUTTON    225
++#define K_DPAD_UP        226
++#define K_DPAD_DOWN      227
++#define K_DPAD_LEFT      228
++#define K_DPAD_RIGHT     229
++#define K_GAMEPAD_LAST   229
++
+ typedef enum {
+     KEY_GAME    = 0,
+     KEY_CONSOLE = BIT(0),
+@@ -144,3 +166,4 @@ int     Key_EnumBindings(int key, const char *binding);
+ void    Key_WriteBindings(qhandle_t f);
+ 
+ void    Key_WaitKey(keywaitcb_t wait, void *arg);
++bool    Key_IsWaiting(void);   // [iOS overlay] pad-rebind capture state
+diff --git a/src/client/keys.c b/src/client/keys.c
+index 2ab3c6b3..a6737fbf 100644
+--- a/src/client/keys.c
++++ b/src/client/keys.c
+@@ -131,6 +131,24 @@ static const keyname_t keynames[] = {
+     K(MWHEELRIGHT),
+     K(MWHEELLEFT),
+ 
++    // gamepad (KEX rerelease default.cfg names) [iOS overlay]
++    K(A_BUTTON),
++    K(B_BUTTON),
++    K(X_BUTTON),
++    K(Y_BUTTON),
++    K(LEFT_SHOULDER),
++    K(RIGHT_SHOULDER),
++    K(LEFT_TRIGGER),
++    K(RIGHT_TRIGGER),
++    K(LEFT_STICK),
++    K(RIGHT_STICK),
++    K(START_BUTTON),
++    K(BACK_BUTTON),
++    K(DPAD_UP),
++    K(DPAD_DOWN),
++    K(DPAD_LEFT),
++    K(DPAD_RIGHT),
++
+     {"SEMICOLON", ';'}, // because a raw semicolon separates commands
+ 
+     {NULL, 0}
+@@ -900,3 +918,11 @@ void Key_WaitKey(keywaitcb_t wait, void *arg)
+     key_wait_cb = wait;
+     key_wait_arg = arg;
+ }
++
++// [iOS overlay] True while the keys menu is waiting to capture a key to bind — the
++// controller layer checks this to send RAW gamepad keys (not menu-nav translations)
++// so pad buttons are rebindable through the normal keys menu.
++bool Key_IsWaiting(void)
++{
++    return key_wait_cb != NULL;
++}

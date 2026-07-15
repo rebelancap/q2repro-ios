@@ -1,0 +1,108 @@
+Subject: [overlay 0008] iOS analog move/look + attract state + weapon-wheel select
+
+CL_SetAnalogMove; CL_iOS_PassiveState/Disconnected/LayoutActive; CL_iOS_LookDelta/LookAnalog
+(bypass sensitivity/accel; controller look 1.3x); CL_iOS_WheelCursor (touch wheel cursor-
+follows-finger); CL_Wheel_Input by direction for the stick. patch -p1 -d vendor/q2repro < this
+
+diff --git a/src/client/input.c b/src/client/input.c
+index dce2b8d7..78278528 100644
+--- a/src/client/input.c
++++ b/src/client/input.c
+@@ -37,6 +37,50 @@ static cvar_t    *m_autosens;
+ static cvar_t    *cl_upspeed;
+ static cvar_t    *cl_forwardspeed;
+ static cvar_t    *cl_sidespeed;
++
++static vec2_t    cl_analog_move;   // analog move axis [-1,1] from touch/controller
++void CL_SetAnalogMove(float forward, float side) { cl_analog_move[0] = forward; cl_analog_move[1] = side; }
++
++// [iOS overlay] Touch/gyro look arrives as ABSOLUTE view-angle degrees (already scaled
++// by the app), added straight to the view — bypassing the engine `sensitivity`/m_accel
++// mouse path so touch feel is controlled solely by ios_sens_*. Controller stick look
++// arrives as a rate fraction. Both also drive the weapon wheel when it is open.
++static vec2_t    cl_ios_look_delta;    // yaw/pitch degrees (touch, gyro)
++static vec2_t    cl_ios_look_analog;   // yaw/pitch rate -1..1 (stick), pre-scaled by sens
++void CL_iOS_LookDelta(float yaw, float pitch)  { cl_ios_look_delta[0] += yaw; cl_ios_look_delta[1] += pitch; }
++void CL_iOS_LookAnalog(float yaw, float pitch) { cl_ios_look_analog[0] = yaw; cl_ios_look_analog[1] = pitch; }
++
++// [iOS overlay] Touch weapon wheel: set the cursor to an ABSOLUTE position (the finger's
++// offset from screen centre, in device px) so it follows the finger — unlike the controller
++// stick, which slams to the rim by direction (WHEEL_OPEN branch in CL_AdjustAngles). The
++// engine clamps the position to the wheel radius, so reaching the rim still selects.
++void CL_iOS_WheelCursor(float x, float y)
++{
++    if (cl.wheel.state == WHEEL_OPEN)
++        CL_Wheel_Input((int)(x - cl.wheel.position[0]), (int)(y - cl.wheel.position[1]));
++}
++
++// [iOS overlay] attract-mode state for the boot sequence: 0 interactive, 1 demo, 2 cinematic.
++int CL_iOS_PassiveState(void)
++{
++    if (cls.state == ca_cinematic) return 2;
++    if (cls.demo.playback) return 1;
++    return 0;
++}
++
++// [iOS overlay] true when no server/demo/cinematic is active (attract loop can (re)start).
++int CL_iOS_Disconnected(void)
++{
++    return cls.state == ca_disconnected;
++}
++
++// [iOS overlay] true while the game is showing a full-screen layout/menu (e.g. Action's
++// join-team / loadout PMenu, or the scoreboard) — so the touch layer can show menu-nav keys.
++int CL_iOS_LayoutActive(void)
++{
++    return cls.state == ca_active &&
++           (cl.frame.ps.stats[STAT_LAYOUTS] & (LAYOUTS_LAYOUT | LAYOUTS_INVENTORY)) != 0;
++}
+ static cvar_t    *cl_yawspeed;
+ static cvar_t    *cl_pitchspeed;
+ static cvar_t    *cl_run;
+@@ -568,11 +612,35 @@ static void CL_AdjustAngles(int msec)
+ {
+     float speed;
+ 
++    // [iOS overlay] drain touch/gyro degrees; while the weapon wheel is open, the
++    // stick selects by DIRECTION (slam the cursor to that angle) and touch nudges it.
++    float gy = cl_ios_look_delta[0], gp = cl_ios_look_delta[1];
++    cl_ios_look_delta[0] = cl_ios_look_delta[1] = 0;
++    if (cl.wheel.state == WHEEL_OPEN) {
++        float sx = cl_ios_look_analog[0], sy = -cl_ios_look_analog[1];
++        float mag = sqrtf(sx * sx + sy * sy);
++        if (mag > 0.20f)
++            CL_Wheel_Input((int)(sx / mag * 10000.0f - cl.wheel.position[0]),
++                           (int)(sy / mag * 10000.0f - cl.wheel.position[1]));
++        else if (gy || gp)
++            CL_Wheel_Input((int)(-gy * 14.0f), (int)(-gp * 14.0f));
++        return;
++    }
++    // touch/gyro: absolute degrees straight into the view (no sensitivity/accel mul)
++    cl.viewangles[YAW]   += gy;
++    cl.viewangles[PITCH] += gp;
++
+     if (in_speed.state & 1)
+         speed = msec * cl_anglespeedkey->value * 0.001f;
+     else
+         speed = msec * 0.001f;
+ 
++    // controller stick look: rate scaled by the turn-speed cvars
++    if (cl_ios_look_analog[0] || cl_ios_look_analog[1]) {
++        cl.viewangles[YAW]   -= speed * cl_yawspeed->value   * 1.3f * cl_ios_look_analog[0];
++        cl.viewangles[PITCH] -= speed * cl_pitchspeed->value * 1.3f * cl_ios_look_analog[1];
++    }
++
+     if (!(in_strafe.state & 1)) {
+         cl.viewangles[YAW] -= speed * cl_yawspeed->value * CL_KeyState(&in_right);
+         cl.viewangles[YAW] += speed * cl_yawspeed->value * CL_KeyState(&in_left);
+@@ -608,6 +676,10 @@ static void CL_BaseMove(vec2_t move)
+         move[0] -= cl_forwardspeed->value * CL_KeyState(&in_back);
+     }
+ 
++    // analog movement injection (iOS touch joystick / controller), range [-1,1]
++    move[0] += cl_forwardspeed->value * cl_analog_move[0];
++    move[1] += cl_sidespeed->value * cl_analog_move[1];
++
+ // adjust for speed key / running
+     if ((in_speed.state & 1) ^ cl_run->integer) {
+         Vector2Scale(move, 2, move);
