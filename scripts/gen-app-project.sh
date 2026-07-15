@@ -26,7 +26,7 @@ settings:
     TARGETED_DEVICE_FAMILY: "1"
     ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon   # app icon (Assets.xcassets)
     STRIP_INSTALLED_PRODUCT: NO   # archives strip exported symbols → dlsym-class silent crashes
-    MARKETING_VERSION: "1.0.0"
+    MARKETING_VERSION: "1.0.1"
     CURRENT_PROJECT_VERSION: "1"
     GCC_C_LANGUAGE_STANDARD: gnu11
     GCC_WARN_ABOUT_DEPRECATED_FUNCTIONS: NO
@@ -272,12 +272,20 @@ if [ "${Q2_VISIONOS:-0}" = "1" ]; then
     -e '/- sdk: OpenGLES.framework/d' \
     -e 's#angle-prebuilt-ios#angle-prebuilt-visionos#g' \
     -e 's#work/ios-deps/prefix#work/xros-deps/prefix#g' \
-    -e 's/ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon/ASSETCATALOG_COMPILER_APPICON_NAME: AppIconVision/' \
     "$OUT"
+  # visionOS icon (1.0.1 hotfix): Files renders an app's folder icon only when the
+  # catalog's layered stack is NAMED "AppIcon" (vkQuake parity — its working config is
+  # Assets-visionos.xcassets/AppIcon.solidimagestack). The iOS AppIcon.appiconset has no
+  # vision idiom (actool emits nothing for it on xros), so swap catalogs: exclude the iOS
+  # one, add the visionOS one whose stack is AppIcon.
+  sed -i '' -e 's/^          - "immersive"     .*/&\
+          - "Assets.xcassets"   # visionOS icon comes from Assets-visionos.xcassets instead/' "$OUT"
+  sed -i '' -e 's/^      - path: data          .*/      - path: Assets-visionos.xcassets\
+        buildPhase: resources\
+&/' "$OUT"
   # CFBundleIconName is how visionOS LaunchServices locates the app icon in the asset
   # catalog. xcodegen's generated Info.plist doesn't get the actool partial-plist merge
-  # that would normally add it, so set it explicitly (points at AppIconVision, the layered
-  # .solidimagestack). Without this the icon renders blank.
+  # that would normally add it, so set it explicitly. Without this the icon renders blank.
   if [ "${Q2_VISIONOS_3D:-0}" = "1" ]; then
     # 3D shell is SwiftUI (@main App). It still needs a UIApplicationSceneManifest or
     # openImmersiveSpace() returns .error — but a SwiftUI-managed one: multiple-scene support
@@ -285,7 +293,7 @@ if [ "${Q2_VISIONOS:-0}" = "1" ]; then
     # and ImmersiveSpace from the App body at runtime. (INFOPLIST_KEY_…Generation does NOT emit
     # this into an explicit Info.plist — only with GENERATE_INFOPLIST_FILE — so write it here.)
     MAN="$(mktemp)"; cat > "$MAN" <<'PLIST'
-        CFBundleIconName: AppIconVision
+        CFBundleIconName: AppIcon
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: true
           UISceneConfigurations: {}
@@ -296,7 +304,7 @@ PLIST
     # scenes, EMPTY configurations, NO SceneDelegate (the class is compiled out under
     # Q2_XR_UI — also defeats UIKit's persisted-scene-session install-over trap).
     MAN="$(mktemp)"; cat > "$MAN" <<'PLIST'
-        CFBundleIconName: AppIconVision
+        CFBundleIconName: AppIcon
         NSWorldSensingUsageDescription: q2repro places the 3D game screen in your room.
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: true

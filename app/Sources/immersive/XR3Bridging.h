@@ -8,6 +8,7 @@
 UIViewController *Q2_MakeGameViewController(void);
 void Q2_XR3_EngineEnter3D(void);   // engine → offscreen stereo (call BEFORE openImmersiveSpace)
 void Q2_XR3_EngineExit3D(void);    // engine → window surface   (call AFTER dismissImmersiveSpace)
+void Q2_XR3_ScenePhase(int active); // scene became active (1) / backgrounded (0) — audio + link
 
 // vid_angle.m stereo mode (consumer-side hooks for the SwiftUI compositor loop).
 bool VID_iOS_XR3_SetEyeTexture(int eye, void *mtlTexture);  // wrap an app-owned MTLTexture as the eye FBO

@@ -67,6 +67,7 @@ struct Q2VisionApp: App {
     @ObservedObject var model = Q2AppModel.shared
     @Environment(\.openImmersiveSpace) private var openSpace
     @Environment(\.dismissImmersiveSpace) private var dismissSpace
+    @Environment(\.scenePhase) private var scenePhase
 
     // Park the 2D window as a small control card while in 3D (vkQuake UX). visionOS can't
     // move windows programmatically — the user parks the card once; the system remembers.
@@ -121,6 +122,17 @@ struct Q2VisionApp: App {
                             try? await Task.sleep(for: .seconds(25))
                             model.immersive = false
                         }
+                    }
+                }
+                .onChange(of: scenePhase) { _, phase in
+                    // Forward scene activation to the engine (audio session + display link).
+                    // While immersive the aggregate phase stays .active (the space is a scene),
+                    // so 3D is never wrongly paused; this fires when the WINDOW is closed and
+                    // reopened outside 3D — previously the game came back silent.
+                    switch phase {
+                    case .active: Q2_XR3_ScenePhase(1)
+                    case .background: if !model.immersive { Q2_XR3_ScenePhase(0) }
+                    default: break
                     }
                 }
                 .onReceive(NotificationCenter.default.publisher(for: UIScene.didDisconnectNotification)) { _ in

@@ -1350,6 +1350,24 @@ UIViewController *Q2_MakeGameViewController(void) {
     return vc;
 }
 
+// Scene-phase forwarding from the SwiftUI shell. The classic builds' SceneDelegate
+// forwarded scene activation to the AppDelegate handlers, whose CL_Activate(ACT_ACTIVATED)
+// reactivates the AVAudioSession + restarts the CoreAudio unit; the merged SwiftUI app
+// compiled that out, so closing the window (app suspends, audio unit stops) and reopening
+// left the game silent until relaunch. active: 1 = scene active, 0 = backgrounded.
+void Q2_XR3_ScenePhase(int active) {
+    AppDelegate *app = Q2_SharedController();
+    if (!app.engineStarted) return;
+    if (active) {
+        app.link.paused = NO;
+        CL_Activate(ACT_ACTIVATED);       // → S_Activate → session setActive + AudioOutputUnitStart
+    } else {
+        VID_iOS_Command("writeconfig q2reproconfig.cfg");   // iOS/visionOS kill backgrounded apps
+        CL_Activate(ACT_MINIMIZED);
+        app.link.paused = YES;
+    }
+}
+
 // 3D entry/exit, called from the SwiftUI shell AROUND openImmersiveSpace/dismiss.
 // Order is load-bearing (vkQuake): the engine must stop touching the window surface
 // BEFORE the space opens, and only return to it AFTER the space is dismissed.
