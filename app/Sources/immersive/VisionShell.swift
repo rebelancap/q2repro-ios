@@ -39,7 +39,26 @@ final class Q2AppModel: ObservableObject {
     static let shared = Q2AppModel()
     @Published var immersive = false
     @Published var showSettings = false
-    var preParkSize = CGSize(width: 1280, height: 720)   // window size to restore after 3D
+    // Window size to restore after 3D. Persisted: visionOS remembers the PARKED size as
+    // the window's size across relaunches, so if the app dies while parked (backgrounded
+    // apps are killed) the next launch opens tiny with nothing in memory to undo it.
+    var preParkSize: CGSize {
+        didSet {
+            UserDefaults.standard.set(Double(preParkSize.width), forKey: "xr_preParkW")
+            UserDefaults.standard.set(Double(preParkSize.height), forKey: "xr_preParkH")
+        }
+    }
+    private init() {
+        let d = UserDefaults.standard
+        let w = d.double(forKey: "xr_preParkW"), h = d.double(forKey: "xr_preParkH")
+        preParkSize = (w > 50 && h > 50) ? CGSize(width: w, height: h)
+                                         : CGSize(width: 1280, height: 720)
+    }
+}
+
+// The parked-card footprint (and the exclusion box used everywhere a size is judged).
+func q2NearParkSize(_ sz: CGSize) -> Bool {
+    abs(sz.width - 480) < 60 && abs(sz.height - 300) < 60
 }
 
 // The UIKit game window, hosted. Q2_MakeGameViewController (main.m) builds the GameVC +
@@ -77,9 +96,24 @@ struct Q2VisionApp: App {
             .first(where: { $0.session.role == .windowApplication }) else { return }
         ws.requestGeometryUpdate(.Vision(size: size))
     }
-    private func currentWindowSize() -> CGSize {
+    // The REAL window size, nil when no window scene is connected (don't substitute a
+    // default here — callers must know the difference between "small" and "not there").
+    private func actualWindowSize() -> CGSize? {
         UIApplication.shared.connectedScenes.compactMap { ($0 as? UIWindowScene)?.keyWindow?.bounds.size }
-            .first ?? CGSize(width: 1280, height: 720)
+            .first
+    }
+    // Convergent restore. A single requestGeometryUpdate is NOT reliable here: right
+    // after dismissImmersiveSpace the window scene can be backgrounded (visionOS drops
+    // geometry requests for non-foreground scenes), and after a crown exit with the
+    // parked card closed there is briefly NO window scene at all — the one-shot restore
+    // silently no-oped in both flows and the window stayed card-sized. Re-request until
+    // the window actually leaves the parked footprint (bounded ~6 s).
+    private func restoreWindowSize(_ size: CGSize) async {
+        for _ in 0..<30 {
+            setWindowSize(size)
+            try? await Task.sleep(for: .milliseconds(200))
+            if let sz = actualWindowSize(), !q2NearParkSize(sz) { return }
+        }
     }
 
     var body: some Scene {
@@ -130,7 +164,14 @@ struct Q2VisionApp: App {
                     // so 3D is never wrongly paused; this fires when the WINDOW is closed and
                     // reopened outside 3D — previously the game came back silent.
                     switch phase {
-                    case .active: Q2_XR3_ScenePhase(1)
+                    case .active:
+                        Q2_XR3_ScenePhase(1)
+                        // Un-park on reactivation: a window that comes back OUTSIDE 3D at the
+                        // parked footprint is a stranded card (relaunch-while-parked, or the
+                        // scene reconnected after the exit task's restore window passed).
+                        if !model.immersive, let sz = actualWindowSize(), q2NearParkSize(sz) {
+                            Task { await restoreWindowSize(model.preParkSize) }
+                        }
                     case .background: if !model.immersive { Q2_XR3_ScenePhase(0) }
                     default: break
                     }
@@ -150,9 +191,9 @@ struct Q2VisionApp: App {
                             // only sizes near the parked card itself (480x300) — capturing that
                             // is how the window got stuck tiny; any OTHER size is the user's real
                             // window and must round-trip EXACTLY, even a deliberately small one.
-                            let sz = currentWindowSize()
-                            let nearPark = abs(sz.width - 480) < 60 && abs(sz.height - 300) < 60
-                            if !nearPark, sz.width > 50 { model.preParkSize = sz }
+                            if let sz = actualWindowSize(), !q2NearParkSize(sz), sz.width > 50 {
+                                model.preParkSize = sz
+                            }
                             Q2_XR3_EngineEnter3D()           // offscreen BEFORE the space opens
                             switch await openSpace(id: "q2-3d") {
                             case .opened:
@@ -178,7 +219,7 @@ struct Q2VisionApp: App {
                             Q2_XR3_EngineExit3D()            // back to the window AFTER dismissal
                             // Restore the window; its resize handler (no longer gated) rebuilds
                             // the EGL surface at the restored size.
-                            setWindowSize(model.preParkSize)
+                            await restoreWindowSize(model.preParkSize)
                         }
                     }
                 }

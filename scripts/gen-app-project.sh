@@ -26,7 +26,7 @@ settings:
     TARGETED_DEVICE_FAMILY: "1"
     ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon   # app icon (Assets.xcassets)
     STRIP_INSTALLED_PRODUCT: NO   # archives strip exported symbols → dlsym-class silent crashes
-    MARKETING_VERSION: "1.0.2"
+    MARKETING_VERSION: "1.0.3"
     CURRENT_PROJECT_VERSION: "1"
     GCC_C_LANGUAGE_STANDARD: gnu11
     GCC_WARN_ABOUT_DEPRECATED_FUNCTIONS: NO
