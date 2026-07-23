@@ -30,7 +30,7 @@ On **Apple Vision Pro**, first install SideStore onto the headset with
 installed on visionOS the usual way — iloader is what gets SideStore there). Then add the source in
 SideStore exactly as above. No Xcode or Dev Strap required.
 
-**Prefer a manual install?** Download `Quake2-*-iOS.ipa` / `Quake2-*-visionOS.ipa` from the
+**Prefer a manual install?** Download `q2repro-*-iOS.ipa` / `q2repro-*-visionOS.ipa` from the
 [latest release](../../releases/latest) and install it through SideStore/AltStore yourself (iPhone can
 also use [Sideloadly](https://sideloadly.io)).
 
