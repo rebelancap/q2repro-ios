@@ -25,6 +25,7 @@ enum XR3 {
     static var dim: Float       { f("xr_dim", 0.8) }       // surroundings dimming 0…1 (default 80%)
     static var recenter: Int    { d.integer(forKey: "xr_recenter") }
     static var hideGun: Bool    { d.object(forKey: "xr_hidegun") == nil ? false : d.bool(forKey: "xr_hidegun") }
+    static var sharpen: Float   { f("xr_sharpen", 0.5) }   // CAS strength 0…1 (0 = off)
 }
 
 // Compositor clock instant → the TimeInterval ARKit's queryDeviceAnchor expects.
@@ -48,17 +49,32 @@ final class Q2AppModel: ObservableObject {
             UserDefaults.standard.set(Double(preParkSize.height), forKey: "xr_preParkH")
         }
     }
+    // Explicit park STATE (quake3e's guard) — never re-capture while parked, and never
+    // decide "is it parked" from the window's size alone. Persisted so a kill-while-
+    // parked launch knows to restore.
+    var windowParked: Bool {
+        didSet { UserDefaults.standard.set(windowParked, forKey: "xr_windowParked") }
+    }
     private init() {
         let d = UserDefaults.standard
         let w = d.double(forKey: "xr_preParkW"), h = d.double(forKey: "xr_preParkH")
-        preParkSize = (w > 50 && h > 50) ? CGSize(width: w, height: h)
-                                         : CGSize(width: 1280, height: 720)
+        // ≥400x240 sanity: earlier builds persisted a keyWindow mis-capture (the 182x68
+        // ornament pill) — restoring to that re-shrank the window forever. Heal it.
+        preParkSize = (w >= 400 && h >= 240) ? CGSize(width: w, height: h)
+                                             : CGSize(width: 1280, height: 720)
+        windowParked = d.bool(forKey: "xr_windowParked")
     }
 }
 
 // The parked-card footprint (and the exclusion box used everywhere a size is judged).
+// Checks BOTH the requested 480x300 and the size the system ACTUALLY applied to the park
+// (learned at park time, persisted) — on device the two can differ (min-size clamping),
+// and a mismatch here poisoned the size capture on re-entry.
 func q2NearParkSize(_ sz: CGSize) -> Bool {
-    abs(sz.width - 480) < 60 && abs(sz.height - 300) < 60
+    if abs(sz.width - 480) < 60 && abs(sz.height - 300) < 60 { return true }
+    let d = UserDefaults.standard
+    let pw = d.double(forKey: "xr_parkedW"), ph = d.double(forKey: "xr_parkedH")
+    return pw > 50 && abs(sz.width - pw) < 60 && abs(sz.height - ph) < 60
 }
 
 // The UIKit game window, hosted. Q2_MakeGameViewController (main.m) builds the GameVC +
@@ -91,16 +107,31 @@ struct Q2VisionApp: App {
     // Park the 2D window as a small control card while in 3D (vkQuake UX). visionOS can't
     // move windows programmatically — the user parks the card once; the system remembers.
     private func setWindowSize(_ size: CGSize) {
+        // Never request a degenerate size (quake3e's guard) — a bad stored value must
+        // not be able to shrink the window below usable.
+        guard size.width >= 300, size.height >= 180 else {
+            Q2_XR3_Log("xrwin REFUSED degenerate \(Int(size.width))x\(Int(size.height))")
+            return
+        }
         guard let ws = UIApplication.shared.connectedScenes
             .compactMap({ $0 as? UIWindowScene })
-            .first(where: { $0.session.role == .windowApplication }) else { return }
-        ws.requestGeometryUpdate(.Vision(size: size))
+            .first(where: { $0.session.role == .windowApplication }) else {
+            Q2_XR3_Log("xrwin no window scene for \(Int(size.width))x\(Int(size.height))")
+            return
+        }
+        ws.requestGeometryUpdate(.Vision(size: size)) { error in
+            Q2_XR3_Log("xrwin request \(Int(size.width))x\(Int(size.height)) REJECTED \(error.localizedDescription)")
+        }
     }
-    // The REAL window size, nil when no window scene is connected (don't substitute a
-    // default here — callers must know the difference between "small" and "not there").
+    // The GAME window's real size, nil when not attached. NEVER keyWindow: tapping the
+    // ornament pill ("3D"/gear) makes the pill's ~182x68 host window KEY at exactly the
+    // moment the entry capture runs — keyWindow-based capture recorded THAT, and the
+    // "restore" then faithfully shrank the window to pill size (the device-only
+    // stuck-tiny bug; sim entries are env-driven and never tap, so the sim always
+    // captured correctly). quake3e reads its game VC's window for the same reason.
     private func actualWindowSize() -> CGSize? {
-        UIApplication.shared.connectedScenes.compactMap { ($0 as? UIWindowScene)?.keyWindow?.bounds.size }
-            .first
+        let sz = Q2_XR3_GameWindowSize()
+        return (sz.width > 1 && sz.height > 1) ? sz : nil
     }
     // Convergent restore. A single requestGeometryUpdate is NOT reliable here: right
     // after dismissImmersiveSpace the window scene can be backgrounded (visionOS drops
@@ -109,11 +140,20 @@ struct Q2VisionApp: App {
     // silently no-oped in both flows and the window stayed card-sized. Re-request until
     // the window actually leaves the parked footprint (bounded ~6 s).
     private func restoreWindowSize(_ size: CGSize) async {
-        for _ in 0..<30 {
+        Q2_XR3_Log("xrwin restore to \(Int(size.width))x\(Int(size.height))")
+        for i in 0..<30 {
             setWindowSize(size)
             try? await Task.sleep(for: .milliseconds(200))
-            if let sz = actualWindowSize(), !q2NearParkSize(sz) { return }
+            if let sz = actualWindowSize() {
+                if !q2NearParkSize(sz) {
+                    Q2_XR3_Log("xrwin restored \(Int(sz.width))x\(Int(sz.height)) attempt \(i + 1)")
+                    return
+                }
+            } else if i % 5 == 4 {
+                Q2_XR3_Log("xrwin no key window yet attempt \(i + 1)")
+            }
         }
+        Q2_XR3_Log("xrwin restore GAVE UP after 30 attempts")
     }
 
     var body: some Scene {
@@ -141,6 +181,17 @@ struct Q2VisionApp: App {
                 }
                 .sheet(isPresented: $model.showSettings) { XR3SettingsSheet() }
                 .task {
+                    // Launch-while-parked rescue: if the app died in 3D, visionOS reopens the
+                    // window at the remembered (parked) size and no un-park event may fire.
+                    Task {
+                        try? await Task.sleep(for: .seconds(3))
+                        let stuck = model.windowParked || actualWindowSize().map(q2NearParkSize) == true
+                        if !model.immersive, stuck {
+                            Q2_XR3_Log("xrwin launched parked (flag \(model.windowParked)) unparking")
+                            model.windowParked = false
+                            await restoreWindowSize(model.preParkSize)
+                        }
+                    }
                     // Headless sim validation (taps can't be injected on the visionOS sim):
                     // Q2_XR_AUTOENTER=1 enters 3D after boot; Q2_XR_AUTOEXIT=1 leaves again
                     // later, proving the full 2D→3D→2D round trip. No effect without the env.
@@ -164,14 +215,7 @@ struct Q2VisionApp: App {
                     // so 3D is never wrongly paused; this fires when the WINDOW is closed and
                     // reopened outside 3D — previously the game came back silent.
                     switch phase {
-                    case .active:
-                        Q2_XR3_ScenePhase(1)
-                        // Un-park on reactivation: a window that comes back OUTSIDE 3D at the
-                        // parked footprint is a stranded card (relaunch-while-parked, or the
-                        // scene reconnected after the exit task's restore window passed).
-                        if !model.immersive, let sz = actualWindowSize(), q2NearParkSize(sz) {
-                            Task { await restoreWindowSize(model.preParkSize) }
-                        }
+                    case .active: Q2_XR3_ScenePhase(1)
                     case .background: if !model.immersive { Q2_XR3_ScenePhase(0) }
                     default: break
                     }
@@ -183,16 +227,38 @@ struct Q2VisionApp: App {
                         UIApplication.shared.requestSceneSessionActivation(nil, userActivity: nil, options: nil, errorHandler: nil)
                     }
                 }
+                .onReceive(NotificationCenter.default.publisher(for: UIScene.didActivateNotification)) { _ in
+                    // Un-park backstop on PER-SCENE activation (the aggregate scenePhase never
+                    // transitions during a 3D exit — the space keeps it .active, so an
+                    // onChange-based backstop silently never fired; that was the still-tiny-
+                    // after-exit bug's escape hatch failing). Covers relaunch-while-parked and
+                    // scenes that reconnect after the exit task's restore window passed.
+                    if !model.immersive, model.windowParked || actualWindowSize().map(q2NearParkSize) == true {
+                        Q2_XR3_Log("xrwin activated parked (flag \(model.windowParked)) unparking")
+                        model.windowParked = false
+                        Task { await restoreWindowSize(model.preParkSize) }
+                    }
+                }
                 .onChange(of: model.immersive) { _, on in
                     Task { @MainActor in
                         if on {
                             // Capture the restore size FIRST — before the space opens (a mixed
-                            // space can resize the window by the time openSpace returns). Exclude
-                            // only sizes near the parked card itself (480x300) — capturing that
-                            // is how the window got stuck tiny; any OTHER size is the user's real
-                            // window and must round-trip EXACTLY, even a deliberately small one.
-                            if let sz = actualWindowSize(), !q2NearParkSize(sz), sz.width > 50 {
+                            // space can resize the window by the time openSpace returns) — and
+                            // ONLY when not parked: an explicit STATE flag, not a size heuristic
+                            // (quake3e's guard; heuristics mis-fired and poisoned the capture).
+                            // ≥400x240: a real game window is never smaller (the park card is
+                            // 480x300); anything below is a mis-read — keep the last good size.
+                            if !model.windowParked, let sz = actualWindowSize(),
+                               sz.width >= 400, sz.height >= 240 {
                                 model.preParkSize = sz
+                                Q2_XR3_Log("xrwin captured \(Int(sz.width))x\(Int(sz.height))")
+                            } else {
+                                Q2_XR3_Log("xrwin capture skipped keeping \(Int(model.preParkSize.width))x\(Int(model.preParkSize.height))")
+                            }
+                            // Draw-objects don't survive relaunch — re-apply the FPS counter
+                            // from the persisted toggle on every 3D entry.
+                            if UserDefaults.standard.bool(forKey: "xr_fps") {
+                                VID_iOS_Command("undraw cl_fps; draw cl_fps -4 -4")
                             }
                             Q2_XR3_EngineEnter3D()           // offscreen BEFORE the space opens
                             switch await openSpace(id: "q2-3d") {
@@ -201,12 +267,27 @@ struct Q2VisionApp: App {
                                 // Park the window as a ~480pt card AFTER the space is up
                                 // (spec: ~1.5 s; resize is inert to the engine — gated).
                                 try? await Task.sleep(for: .seconds(1.5))
-                                if model.immersive { setWindowSize(CGSize(width: 480, height: 300)) }
+                                if model.immersive {
+                                    model.windowParked = true
+                                    setWindowSize(CGSize(width: 480, height: 300))
+                                    Q2_XR3_Log("xrwin parked")
+                                }
                             default:
                                 Q2_XR3_EngineExit3D()        // roll back — never leave the engine offscreen
                                 model.immersive = false
                             }
                         } else {
+                            // UN-PARK FIRST, before the space dismissal — quake3e recipe trap c:
+                            // never run the resize animation concurrently with the mode
+                            // transition. Under mixed immersion the window scene is still
+                            // active HERE, so this single request lands reliably; issued after
+                            // dismissSpace() it raced the transition and was dropped on device
+                            // (the stuck-tiny-window bug — sim transitions are too fast to show it).
+                            if model.windowParked {
+                                model.windowParked = false
+                                setWindowSize(model.preParkSize)
+                                Q2_XR3_Log("xrwin unpark to \(Int(model.preParkSize.width))x\(Int(model.preParkSize.height)) before dismiss")
+                            }
                             // Stop the render thread and wait for it BEFORE dismissing, so it
                             // never touches a layerRenderer SwiftUI is tearing down (vkQuake's
                             // immStop/immRunning handshake; ≤2 s bound).
@@ -217,9 +298,12 @@ struct Q2VisionApp: App {
                             await dismissSpace()
                             q2SetAudioFrontStage(false)
                             Q2_XR3_EngineExit3D()            // back to the window AFTER dismissal
-                            // Restore the window; its resize handler (no longer gated) rebuilds
-                            // the EGL surface at the restored size.
-                            await restoreWindowSize(model.preParkSize)
+                            // Belt: if the pre-dismiss request still didn't take, the logged
+                            // retry loop hammers it until the window leaves the parked footprint.
+                            try? await Task.sleep(for: .seconds(1.0))
+                            if let sz = actualWindowSize(), q2NearParkSize(sz) {
+                                await restoreWindowSize(model.preParkSize)
+                            }
                         }
                     }
                 }
@@ -244,6 +328,8 @@ struct XR3SettingsSheet: View {
     @AppStorage("xr_sep_pct") private var sepPct = 100.0
     @AppStorage("xr_conv")    private var conv   = 240.0
     @AppStorage("xr_dim")     private var dim    = 0.8
+    @AppStorage("xr_quality") private var quality = 0.6   // device-measured: locked 120/120 at 60%
+    @AppStorage("xr_sharpen") private var sharpen = 0.5
     @AppStorage("xr_hidegun") private var hideGun = false
     @AppStorage("xr_fps")     private var fpsOn  = false
     @AppStorage("xr_unitsFt") private var unitsFt = true
@@ -292,6 +378,8 @@ struct XR3SettingsSheet: View {
                         Button("Reset") {   // 3D keys only; units + FPS prefs kept (spec)
                             dist = 3.6; halfW = 2.75; halfH = 1.55; posH = 0
                             sepPct = 100; conv = 240; dim = 0.8; hideGun = false
+                            quality = 1.0
+                            VID_iOS_XR3_ResizeEyes()   // apply the restored aspect/budget now
                         }.buttonStyle(.bordered).tint(.orange).font(.caption)
                     }.padding(.top, 8)
                     row("Screen Distance", $dist, 1.0...8.0, len(dist))
@@ -301,14 +389,30 @@ struct XR3SettingsSheet: View {
                     row("Stereo Depth", $sepPct, 0...320, String(format: "%.0f%%", sepPct))
                     row("Crosshair Distance", $conv, 32...512, len(conv * 0.0254))  // 1 unit ≈ 1 inch
                     row("Surroundings Dimming", $dim, 0...1, String(format: "%.0f%%", dim * 100))
+                    // Per-eye render budget as a % of the 8.3 MP vkQuake formula. Q2
+                    // rerelease frames through ANGLE are much heavier than Q1 Vulkan —
+                    // lower this if 3D feels laggy (FOVEATION-PERF-CONSULT.md).
+                    row("Render Resolution", $quality, 0.4...1.0,
+                        String(format: "%.0f%%", quality * 100), resync: true)
+                    // CAS strength: the upscale companion to a reduced budget — restores
+                    // perceived edge crispness the panel's slight magnification softens.
+                    // Applies live (read per published engine frame).
+                    row("Sharpening", $sharpen, 0...1, String(format: "%.0f%%", sharpen * 100))
+                    Text("These two work together: lower resolution keeps 3D fast and smooth, Sharpening restores the crispness. 60% + 100% is the sweet spot.")
+                        .font(.caption2).foregroundStyle(.secondary)
                     let aspect = max(0.5, min(4.0, halfW / max(halfH, 0.01)))
-                    let pw = Int((Double(3840 * 2160) * aspect).squareRoot().rounded())
+                    let pw = Int((Double(3840 * 2160) * max(0.4, min(1.0, quality)) * aspect).squareRoot().rounded())
                     info("Panel Width", "\(pw & ~7) px")
                     info("Panel Height", "\((Int((Double(pw) / aspect).rounded())) & ~7) px")
                     info("Aspect Ratio", String(format: "%.1f:9", aspect * 9))
                     Toggle("Hide weapon", isOn: $hideGun)
                     Toggle("FPS on Panel", isOn: $fpsOn)
-                        .onChange(of: fpsOn) { _, on in VID_iOS_Command(on ? "set scr_fps 1" : "set scr_fps 0") }
+                        .onChange(of: fpsOn) { _, on in
+                            // Q2PRO has no scr_fps cvar; fps is a draw-object ("draw cl_fps x y",
+                            // negative coords anchor right/bottom). It lands in the 2D pass, which
+                            // renders into BOTH eye textures — visible on the panel and in 2D.
+                            VID_iOS_Command(on ? "undraw cl_fps; draw cl_fps -4 -4" : "undraw cl_fps")
+                        }
                     HStack {
                         Text("Units").frame(width: 190, alignment: .leading)
                         Picker("", selection: $unitsFt) {
@@ -329,11 +433,32 @@ struct XR3SettingsSheet: View {
 
 struct Q2XRConfig: CompositorLayerConfiguration {
     func makeConfiguration(capabilities: LayerRenderer.Capabilities, configuration: inout LayerRenderer.Configuration) {
-        configuration.depthFormat = .depth32Float
-        configuration.colorFormat = .rgba16Float
-        configuration.isFoveationEnabled = false
+        // Negotiate formats like vkQuake/quake3e/SoH instead of hardcoding rgba16Float:
+        // the system's preferred format is 8-bit sRGB — HALF the drawable bandwidth of
+        // float16 in our pass and in the system's foveated unwarp, on the GPU the engine
+        // is already saturating (FOVEATION-PERF-CONSULT.md). The panel shader outputs
+        // linear either way; an sRGB store re-encodes in hardware.
+        configuration.depthFormat = capabilities.supportedDepthFormats.first ?? .depth32Float
+        configuration.colorFormat = capabilities.supportedColorFormats.first ?? .bgra8Unorm_srgb
+        // Eye-tracked foveation de-blurs the panel (VISIONOS-FOVEATION-GUIDE.md): the
+        // drawable becomes gaze-tracked variable-density, so effective foveal resolution
+        // multiplies. The old "foveation off" was a vkQuake Vulkan-era constraint that
+        // never applied to this native-Metal pass. Sim reports supportsFoveation false.
+        // Always on when the hardware supports it — the A/B toggle is retired (off is
+        // just blurry; and a persisted "off" would strand the user blurry with no UI).
+        // The stored xr_foveation key is deliberately IGNORED.
+        let fov = capabilities.supportsFoveation
+        configuration.isFoveationEnabled = fov
         let layouts = capabilities.supportedLayouts(options: [])
-        configuration.layout = layouts.contains(.layered) ? .layered : .dedicated
+        // TRAP (guide #1): layered layout + per-slice passes + foveation = right-eye
+        // fisheye (each pass rasterizes with layer 0's rate map). Dedicated layout gives
+        // per-eye textures AND per-eye rate maps. Do NOT touch maxRenderQuality (trap #2:
+        // aborts at immersive entry).
+        if fov && layouts.contains(.dedicated) {
+            configuration.layout = .dedicated
+        } else {
+            configuration.layout = layouts.contains(.layered) ? .layered : .dedicated
+        }
     }
 }
 
@@ -376,33 +501,55 @@ final class Q2PanelRenderer {
     let worldTracking = WorldTrackingProvider()
     var pipeline: MTLRenderPipelineState?
     var dimPipeline: MTLRenderPipelineState?
+    var casPipeline: MTLComputePipelineState?   // contrast-adaptive sharpen (upscale companion)
     var depthState: MTLDepthStencilState?
-    var eyeTex: [MTLTexture] = []
+    var copyTex: [MTLTexture] = []   // compositor-owned mipmapped copies of the eye images
     var frozenHead: simd_float4x4?
     var frames = 0
     var lastRecenter = XR3.recenter
+    // Pacing telemetry (once per ~5 s into console.log): published engine fps vs the
+    // compositor's, and the in-flight depth — the numbers that judge the producer bound.
+    var statPub: Int32 = 0
+    var statTime = CFAbsoluteTimeGetCurrent()
 
     init(_ layer: LayerRenderer) {
         self.layer = layer
         self.device = layer.device
         self.queue = device.makeCommandQueue()!
         Task { try? await self.arSession.run([self.worldTracking]) }
-        buildPipeline()
+        // Pipelines are built lazily from the FIRST drawable's actual formats (quake3e/
+        // SoH pattern) — the config now negotiates formats instead of hardcoding them.
     }
 
-    // The GLUE owns the eye textures (created before the space opens — fixes the
-    // black first entry). Fetch them once available.
+    // The GLUE owns a ring of eye textures and publishes a pair only when its GPU frame
+    // completes (SoH producer architecture). Fetch the published pair EVERY frame — the
+    // pointer cycles through the ring textures.
     var lastEyeGen: Int32 = -1
-    private func fetchEyeTextures() {
+    var lastBlitFrame: Int32 = -1     // publish count last copied into copyTex
+    private func publishedEyeTextures() -> [MTLTexture]? {
         let gen = VID_iOS_XR3_EyeGeneration()
-        if gen != lastEyeGen { eyeTex = []; lastEyeGen = gen }   // recreated (aspect re-sync) → refetch
-        guard eyeTex.count != 2 else { return }
-        guard let a = VID_iOS_XR3_EyeTexture(0), let b = VID_iOS_XR3_EyeTexture(1) else { return }
-        eyeTex = [Unmanaged<AnyObject>.fromOpaque(a).takeUnretainedValue() as! MTLTexture,
-                  Unmanaged<AnyObject>.fromOpaque(b).takeUnretainedValue() as! MTLTexture]
+        if gen != lastEyeGen { copyTex = []; lastEyeGen = gen; lastBlitFrame = -1 }   // recreated (aspect re-sync)
+        guard let a = VID_iOS_XR3_EyeTexture(0), let b = VID_iOS_XR3_EyeTexture(1) else { return nil }
+        return [Unmanaged<AnyObject>.fromOpaque(a).takeUnretainedValue() as! MTLTexture,
+                Unmanaged<AnyObject>.fromOpaque(b).takeUnretainedValue() as! MTLTexture]
+    }
+    // Compositor-owned mipmapped private copies (the engine textures carry no mips):
+    // copy + mipgen + sample all stay coherent on this queue, fully decoupled from the
+    // engine's. Recreated when the eye size changes.
+    private func ensureCopies(like src: MTLTexture) {
+        if copyTex.count == 2, copyTex[0].width == src.width, copyTex[0].height == src.height { return }
+        lastBlitFrame = -1                        // fresh copies must be filled
+        copyTex = (0..<2).compactMap { _ in
+            let td = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: src.pixelFormat,
+                                                              width: src.width, height: src.height,
+                                                              mipmapped: true)
+            td.usage = [.shaderRead, .shaderWrite, .renderTarget]   // write: CAS; renderTarget: mipgen
+            td.storageMode = .private
+            return device.makeTexture(descriptor: td)
+        }
     }
 
-    private func buildPipeline() {
+    private func buildPipeline(color: MTLPixelFormat, depth: MTLPixelFormat) {
         let src = """
         #include <metal_stdlib>
         using namespace metal;
@@ -428,10 +575,37 @@ final class Q2PanelRenderer {
             return float4(0, 0, 0, a);
         }
         fragment float4 q2frag(VOut in [[stage_in]], texture2d<float> tex [[texture(0)]]) {
-            constexpr sampler s(filter::linear, mip_filter::linear, address::clamp_to_edge);
+            // max_anisotropy(16): the panel is strongly minified and oblique at its
+            // corners — without anisotropy the edges shimmer under motion (SoH parity).
+            constexpr sampler s(filter::linear, mip_filter::linear, address::clamp_to_edge,
+                                max_anisotropy(16));
             float4 c = tex.sample(s, in.uv);
             c.rgb = pow(max(c.rgb, float3(0.0)), 2.2);   // display-encoded → linear drawable
             return float4(c.rgb, 1.0);
+        }
+        // Contrast-adaptive sharpening (CAS): runs ONCE per published engine frame at
+        // texture resolution into the copy's level 0 (the mip chain then propagates it).
+        // This is the "render at 60%, look near-100%" upscale companion: the panel
+        // magnifies the reduced-budget render slightly, and CAS restores the perceived
+        // edge crispness that bilinear magnification softens.
+        kernel void q2cas(texture2d<float, access::read> srcT [[texture(0)]],
+                          texture2d<float, access::write> dstT [[texture(1)]],
+                          constant float& strength [[buffer(0)]],
+                          uint2 gid [[thread_position_in_grid]]) {
+            uint W = dstT.get_width(), H = dstT.get_height();
+            if (gid.x >= W || gid.y >= H) return;
+            float3 c = srcT.read(gid).rgb;
+            float3 a = srcT.read(uint2(gid.x, gid.y > 0 ? gid.y - 1 : 0)).rgb;
+            float3 b = srcT.read(uint2(gid.x > 0 ? gid.x - 1 : 0, gid.y)).rgb;
+            float3 d = srcT.read(uint2(min(gid.x + 1, W - 1), gid.y)).rgb;
+            float3 e = srcT.read(uint2(gid.x, min(gid.y + 1, H - 1))).rgb;
+            float3 mn = min(min(min(a, b), min(d, e)), c);
+            float3 mx = max(max(max(a, b), max(d, e)), c);
+            float3 amp = sqrt(saturate(min(mn, 1.0 - mx) / max(mx, float3(0.001))));
+            float peak = mix(8.0, 5.0, saturate(strength));
+            float3 w = -amp / peak;
+            float3 o = (c + (a + b + d + e) * w) / (1.0 + 4.0 * w);
+            dstT.write(float4(saturate(o), 1.0), gid);
         }
         """
         do {
@@ -439,26 +613,29 @@ final class Q2PanelRenderer {
             let pd = MTLRenderPipelineDescriptor()
             pd.vertexFunction = lib.makeFunction(name: "q2vtx")
             pd.fragmentFunction = lib.makeFunction(name: "q2frag")
-            pd.colorAttachments[0].pixelFormat = .rgba16Float
-            pd.depthAttachmentPixelFormat = .depth32Float
+            pd.colorAttachments[0].pixelFormat = color
+            pd.depthAttachmentPixelFormat = depth
             pd.inputPrimitiveTopology = .triangle
             pipeline = try device.makeRenderPipelineState(descriptor: pd)
             let dp = MTLRenderPipelineDescriptor()
             dp.vertexFunction = lib.makeFunction(name: "q2dimvtx")
             dp.fragmentFunction = lib.makeFunction(name: "q2dimfrag")
-            dp.colorAttachments[0].pixelFormat = .rgba16Float
+            dp.colorAttachments[0].pixelFormat = color
             dp.colorAttachments[0].isBlendingEnabled = true
             dp.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
             dp.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
             dp.colorAttachments[0].sourceAlphaBlendFactor = .one
             dp.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
-            dp.depthAttachmentPixelFormat = .depth32Float
+            dp.depthAttachmentPixelFormat = depth
             dp.inputPrimitiveTopology = .triangle
             dimPipeline = try device.makeRenderPipelineState(descriptor: dp)
             let dsd = MTLDepthStencilDescriptor()
             dsd.depthCompareFunction = .always         // only the panel draws…
             dsd.isDepthWriteEnabled = true             // …but write REAL depth for reprojection
             depthState = device.makeDepthStencilState(descriptor: dsd)
+            if let casFn = lib.makeFunction(name: "q2cas") {
+                casPipeline = try? device.makeComputePipelineState(function: casFn)
+            }
         } catch { NSLog("[q2repro] panel pipeline: \(error)") }
     }
 
@@ -522,15 +699,33 @@ final class Q2PanelRenderer {
         // INVALIDATES the frame: calling endSubmission on it aborts __BUG_IN_CLIENT__
         // ("failures from cp_frame_query_drawables properly handled?"). Just return.
         guard let drawable = drawables.first else { return }
-        fetchEyeTextures()
+        // Pipelines from the FIRST drawable's actual (negotiated) formats.
+        if pipeline == nil, let c0 = drawable.colorTextures.first, let d0 = drawable.depthTextures.first {
+            buildPipeline(color: c0.pixelFormat, depth: d0.pixelFormat)
+            // One-shot diagnostics for the device round: drawable geometry + foveation
+            // state land in console.log (FOVEATION-PERF-CONSULT.md wants these numbers).
+            let vp = drawable.views[0].textureMap.viewport
+            Q2_XR3_Log("xr3diag drawable \(c0.width)x\(c0.height) fmt \(c0.pixelFormat.rawValue) " +
+                       "texs \(drawable.colorTextures.count) views \(drawable.views.count) " +
+                       "rateMaps \(drawable.rasterizationRateMaps.count) vp \(Int(vp.width))x\(Int(vp.height))")
+        }
+        let published = publishedEyeTextures()   // GPU-complete pair, or nil before first frame
         guard let pipeline, let depthState else { frame.endSubmission(); return }
-        // Draw the game only once the engine has actually completed a stereo frame —
-        // sampling the textures before that showed uninitialized black (first-entry bug).
-        let gameReady = eyeTex.count == 2 && VID_iOS_XR3_FramesRendered() > 0
         let t = drawable.frameTiming.presentationTime.timeInterval
         if let a = worldTracking.queryDeviceAnchor(atTimestamp: t) { drawable.deviceAnchor = a }
 
         frames += 1
+        if frames % 450 == 0 {   // ~5 s at 90 Hz
+            let now = CFAbsoluteTimeGetCurrent()
+            let pub = VID_iOS_XR3_FramesRendered()
+            let dt = now - statTime
+            if dt > 0.5, pub >= statPub {
+                let efps = Double(pub - statPub) / dt
+                Q2_XR3_Log(String(format: "xr3stat engine %.1f fps published, compositor %.1f fps, inFlight %d",
+                                  efps, 450.0 / dt, VID_iOS_XR3_InFlight()))
+            }
+            statPub = pub; statTime = now
+        }
         let rc = XR3.recenter
         if rc != lastRecenter { lastRecenter = rc; frozenHead = nil; frames = 0 }
         if frozenHead == nil, frames > 30, let a = drawable.deviceAnchor {
@@ -541,62 +736,102 @@ final class Q2PanelRenderer {
         let worldFromDevice = drawable.deviceAnchor?.originFromAnchorTransform ?? matrix_identity_float4x4
 
         let cmd = queue.makeCommandBuffer()!
-        VID_iOS_XR3_WaitOn(UnsafeMutableRawPointer(Unmanaged.passUnretained(cmd).toOpaque()))
-        // Regenerate the mip chains after the engine's frame (fence above orders it):
-        // minified panel content samples clean instead of shimmering.
-        if gameReady, let blit = cmd.makeBlitCommandEncoder() {
-            for t in eyeTex where t.mipmapLevelCount > 1 { blit.generateMipmaps(for: t) }
-            blit.endEncoding()
+        // No cross-queue fence: `published` is only ever a pair whose engine GPU work
+        // already completed. Copy it into our own mipmapped textures and rebuild the
+        // chains — minified panel content samples clean instead of shimmering.
+        // ONLY when a NEW pair has been published (quake3e's gate): the compositor runs
+        // ~90 Hz and the engine slower — re-copying an unchanged pair burned ~2×8 MP of
+        // blit+mipgen bandwidth per frame for nothing, on the GPU the engine needs.
+        if let pub = published {
+            ensureCopies(like: pub[0])
+            let pubCount = VID_iOS_XR3_FramesRendered()
+            if copyTex.count == 2, pubCount != lastBlitFrame {
+                var strength = XR3.sharpen
+                if let cas = casPipeline, strength > 0.01, let ce = cmd.makeComputeCommandEncoder() {
+                    // CAS pass replaces the plain copy: published → sharpened copy L0.
+                    ce.setComputePipelineState(cas)
+                    for e in 0..<2 {
+                        ce.setTexture(pub[e], index: 0)
+                        ce.setTexture(copyTex[e], index: 1)
+                        ce.setBytes(&strength, length: MemoryLayout<Float>.size, index: 0)
+                        ce.dispatchThreadgroups(
+                            MTLSize(width: (pub[e].width + 7) / 8, height: (pub[e].height + 7) / 8, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1))
+                    }
+                    ce.endEncoding()
+                    if let blit = cmd.makeBlitCommandEncoder() {
+                        for e in 0..<2 { blit.generateMipmaps(for: copyTex[e]) }
+                        blit.endEncoding()
+                    }
+                    lastBlitFrame = pubCount
+                } else if let blit = cmd.makeBlitCommandEncoder() {
+                    for e in 0..<2 {
+                        blit.copy(from: pub[e], sourceSlice: 0, sourceLevel: 0,
+                                  sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+                                  sourceSize: MTLSize(width: pub[e].width, height: pub[e].height, depth: 1),
+                                  to: copyTex[e], destinationSlice: 0, destinationLevel: 0,
+                                  destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
+                        blit.generateMipmaps(for: copyTex[e])
+                    }
+                    blit.endEncoding()
+                    lastBlitFrame = pubCount
+                }
+            }
         }
-        let rpd = MTLRenderPassDescriptor()
-        rpd.colorAttachments[0].texture = drawable.colorTextures[0]
-        rpd.colorAttachments[0].loadAction = .clear
-        rpd.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)  // passthrough
-        rpd.colorAttachments[0].storeAction = .store
-        rpd.depthAttachment.texture = drawable.depthTextures[0]
-        rpd.depthAttachment.loadAction = .clear
-        rpd.depthAttachment.clearDepth = 1.0
-        rpd.depthAttachment.storeAction = .store
-        rpd.rasterizationRateMap = drawable.rasterizationRateMaps.first
-        if drawable.views.count > 1 { rpd.renderTargetArrayLength = drawable.views.count }
-        guard let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) else { frame.endSubmission(); return }
-        enc.setViewports(drawable.views.map { $0.textureMap.viewport })
-        enc.setDepthStencilState(depthState)
-        enc.setCullMode(.none)
+        // Draw the game only once a completed stereo frame has been published — sampling
+        // before that showed uninitialized black (first-entry bug).
+        let gameReady = published != nil && copyTex.count == 2
+        // ONE PASS PER VIEW, targeted through the view's texture map (foveation guide §2):
+        // never hardcode texture 0 / slice i. Dedicated layout (foveation on) → per-eye
+        // texture + per-eye rate map; layered (foveation off) → shared texture, per-slice
+        // passes. Each pass targets a single slice, so shader layer/viewport routing is 0.
         // Surroundings dimming under the panel: perceptual curve (linear "doesn't get dark
         // until 80%"): alpha = 1 − (1 − d)^2.2. Default 80% ≈ 97% dark.
         let d = max(0, min(1, XR3.dim))
         var dimAlpha = Float(1.0 - pow(Double(1.0 - d), 2.2))
-        if let dimPipeline, dimAlpha > 0.003 {
-            enc.setRenderPipelineState(dimPipeline)
-            for (i, _) in drawable.views.enumerated() {
-                var eye = UInt32(i)
-                enc.setVertexBytes(&eye, length: MemoryLayout<UInt32>.size, index: 1)
+        for (i, view) in drawable.views.enumerated() {
+            let tmap = view.textureMap
+            let texIdx = min(tmap.textureIndex, drawable.colorTextures.count - 1)
+            let rpd = MTLRenderPassDescriptor()
+            rpd.colorAttachments[0].texture = drawable.colorTextures[texIdx]
+            rpd.colorAttachments[0].slice = tmap.sliceIndex
+            rpd.colorAttachments[0].loadAction = .clear
+            rpd.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)  // passthrough
+            rpd.colorAttachments[0].storeAction = .store
+            rpd.depthAttachment.texture = drawable.depthTextures[texIdx]
+            rpd.depthAttachment.slice = tmap.sliceIndex
+            rpd.depthAttachment.loadAction = .clear
+            rpd.depthAttachment.clearDepth = 1.0
+            rpd.depthAttachment.storeAction = .store
+            if !drawable.rasterizationRateMaps.isEmpty {   // guide §3: nil when foveation off
+                rpd.rasterizationRateMap =
+                    drawable.rasterizationRateMaps[min(texIdx, drawable.rasterizationRateMaps.count - 1)]
+            }
+            guard let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) else { continue }
+            enc.setViewport(tmap.viewport)               // guide §4: the view's own viewport
+            enc.setDepthStencilState(depthState)
+            enc.setCullMode(.none)
+            var route = UInt32(0)   // single-slice pass: layer/viewport index is always 0
+            if let dimPipeline, dimAlpha > 0.003 {
+                enc.setRenderPipelineState(dimPipeline)
+                enc.setVertexBytes(&route, length: MemoryLayout<UInt32>.size, index: 1)
                 enc.setFragmentBytes(&dimAlpha, length: MemoryLayout<Float>.size, index: 0)
                 enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
             }
-        }
-        guard gameReady else {   // panel not ready: present dim/passthrough only
+            if gameReady {
+                enc.setRenderPipelineState(pipeline)
+                let worldFromEye = worldFromDevice * view.transform
+                // Under MIXED immersion cp_view_get_tangents aborts __BUG_IN_CLIENT__ (it
+                // belongs to the full-immersion contract); use the drawable's projection.
+                let proj = drawable.computeProjection(convention: .rightUpBack, viewIndex: i)
+                var mvp = proj * worldFromEye.inverse * model
+                enc.setVertexBytes(&mvp, length: MemoryLayout<simd_float4x4>.size, index: 0)
+                enc.setVertexBytes(&route, length: MemoryLayout<UInt32>.size, index: 1)
+                enc.setFragmentTexture(copyTex[min(i, 1)], index: 0)
+                enc.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+            }
             enc.endEncoding()
-            drawable.encodePresent(commandBuffer: cmd)
-            cmd.commit()
-            frame.endSubmission()
-            return
         }
-        enc.setRenderPipelineState(pipeline)
-        for (i, view) in drawable.views.enumerated() {
-            let worldFromEye = worldFromDevice * view.transform
-            // Under MIXED immersion cp_view_get_tangents aborts __BUG_IN_CLIENT__ (it belongs
-            // to the full-immersion drawable contract); use the drawable's own projection.
-            let proj = drawable.computeProjection(convention: .rightUpBack, viewIndex: i)
-            var mvp = proj * worldFromEye.inverse * model
-            var eye = UInt32(i)
-            enc.setVertexBytes(&mvp, length: MemoryLayout<simd_float4x4>.size, index: 0)
-            enc.setVertexBytes(&eye, length: MemoryLayout<UInt32>.size, index: 1)
-            enc.setFragmentTexture(eyeTex[min(i, 1)], index: 0)
-            enc.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
-        }
-        enc.endEncoding()
         drawable.encodePresent(commandBuffer: cmd)
         cmd.commit()
         frame.endSubmission()

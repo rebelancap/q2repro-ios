@@ -10,14 +10,17 @@ void Q2_XR3_EngineEnter3D(void);   // engine → offscreen stereo (call BEFORE o
 void Q2_XR3_EngineExit3D(void);    // engine → window surface   (call AFTER dismissImmersiveSpace)
 void Q2_XR3_ScenePhase(int active); // scene became active (1) / backgrounded (0) — audio + link
 
-// vid_angle.m stereo mode (consumer-side hooks for the SwiftUI compositor loop).
-bool VID_iOS_XR3_SetEyeTexture(int eye, void *mtlTexture);  // wrap an app-owned MTLTexture as the eye FBO
-void *VID_iOS_XR3_EyeTexture(int eye);                      // the glue-owned eye texture (created on 3D entry)
-int  VID_iOS_XR3_FramesRendered(void);                      // stereo frames completed since entering 3D
+// xr3_glue.m stereo mode (consumer-side hooks for the SwiftUI compositor loop).
+void *VID_iOS_XR3_EyeTexture(int eye);                      // last PUBLISHED (GPU-complete) eye texture, or NULL
+int  VID_iOS_XR3_FramesRendered(void);                      // published stereo frames since entering 3D
+int  VID_iOS_XR3_InFlight(void);                            // engine frames submitted but not GPU-complete (0–2)
 int  VID_iOS_XR3_EyeGeneration(void);                       // bumps when the eye textures are recreated
 void VID_iOS_XR3_ResizeEyes(void);                          // re-sync render size to the panel aspect (main thread)
-void VID_iOS_XR3_WaitOn(void *mtlCommandBuffer);            // wait on the engine's stereo-frame fence
 int  VID_iOS_XR3_Active(void);
 
 // vid_angle.m: run a console command (FPS toggle etc.)
 void VID_iOS_Command(const char *cmd);
+// main.m: diagnostics routed into the engine console log (console-safe text only)
+void Q2_XR3_Log(const char *msg);
+// main.m: the GAME window's size (CGSizeZero when not attached) — never keyWindow
+CGSize Q2_XR3_GameWindowSize(void);

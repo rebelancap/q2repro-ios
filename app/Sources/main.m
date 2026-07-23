@@ -728,6 +728,21 @@ static NSString *DocsDir(void) {
 // Fable-style first-run intro: a branded full-screen card explaining that game data
 // is required, with a folder picker and a re-check button. Stays up until data lands.
 - (void)presentImporter {
+    // An EMPTY Documents folder does not appear in the Files app at all (vkQuake
+    // ios_onboarding.m parity): seed ONLY a guide file so "On My iPhone/Vision Pro ->
+    // q2repro" exists immediately for the copy-in path. Never pre-create baseq2/ — Files
+    // renames a user-dropped folder to "baseq2 2" when one already exists.
+    NSFileManager *fm = NSFileManager.defaultManager; NSString *d = DocsDir();
+    NSString *readme = [d stringByAppendingPathComponent:@"READ ME - put Quake II data here.txt"];
+    if (![fm fileExistsAtPath:readme]) {
+        [@"Copy your Quake II game data into this folder, then relaunch the app (or tap Check Again).\n\n"
+          "Recommended - the 2023 re-release (Steam/GOG):\n"
+          "  rerelease/baseq2/  plus its Q2Game.kpf next to baseq2\n\n"
+          "Also works - the original release:\n"
+          "  baseq2/            with pak0.pak inside\n\n"
+          "You can also use the in-app \"Select Game Data Folder\" button instead - it copies for you.\n"
+         writeToFile:readme atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+    }
     UIViewController *vc = self.gameVC;
     UIView *root = vc.view;
     UIView *card = [[UIView alloc] initWithFrame:root.bounds];
@@ -1373,6 +1388,25 @@ void Q2_XR3_ScenePhase(int active) {
 // BEFORE the space opens, and only return to it AFTER the space is dismissed.
 void Q2_XR3_EngineEnter3D(void) { VID_iOS_XR3_SetMode(1); }
 void Q2_XR3_EngineExit3D(void)  { VID_iOS_XR3_SetMode(0); }
+
+// The GAME window's size — never UIApplication.keyWindow. Tapping the ornament pill
+// ("3D"/gear) makes the pill's ~182x68 host window KEY at exactly the moment the entry
+// capture runs, which poisoned the restore size on device for weeks (sim entries are
+// env-driven, never tap, so the sim could not reproduce it). quake3e reads its game
+// VC's window for the same reason.
+CGSize Q2_XR3_GameWindowSize(void) {
+    UIWindow *w = Q2_SharedController().gameVC.view.window;
+    return w ? w.bounds.size : CGSizeZero;
+}
+
+// Window-geometry diagnostics from the SwiftUI shell, routed into the engine console so
+// they land in logs/console.log (the one channel the user can pull from the device).
+// Message must be console-safe: no quotes/semicolons.
+void Q2_XR3_Log(const char *msg) {
+    AppDelegate *app = Q2_SharedController();
+    if (!app.engineStarted) { NSLog(@"[q2repro] %s", msg); return; }
+    VID_iOS_Command([NSString stringWithFormat:@"echo %s", msg].UTF8String);
+}
 #else
 int main(int argc, char *argv[]) {
     @autoreleasepool { return UIApplicationMain(argc, argv, nil, NSStringFromClass([AppDelegate class])); }
