@@ -26,7 +26,7 @@ settings:
     TARGETED_DEVICE_FAMILY: "1"
     ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon   # app icon (Assets.xcassets)
     STRIP_INSTALLED_PRODUCT: NO   # archives strip exported symbols → dlsym-class silent crashes
-    MARKETING_VERSION: "1.0.8"
+    MARKETING_VERSION: "1.0.9"
     CURRENT_PROJECT_VERSION: "1"
     GCC_C_LANGUAGE_STANDARD: gnu11
     GCC_WARN_ABOUT_DEPRECATED_FUNCTIONS: NO
@@ -37,6 +37,10 @@ settings:
       - USE_REF=1
       - _GNU_SOURCE=1
       - Q2_USE_ANGLE=__ANGLE__
+      # OTA-only dev builds (4-component version, e.g. 1.0.8.2) get Q2_DEV_BUILD=1, which enables
+      # dev-only features (the remote console). Public releases are 3-component (1.0.9) → 0, so
+      # those features COMPILE OUT entirely. Derived from the version below — no manual flag (§6).
+      - Q2_DEV_BUILD=__DEV__
       # angle-bracket form avoids quote-escaping; resolves via -Iinc. Do NOT add
       # inc/common to the header path — it shadows the system <math.h>.
       - Q2PROTO_CONFIG_H=<common/q2proto_config.h>
@@ -256,6 +260,13 @@ TAIL3
 # frameworks are always linked/embedded but inert when Q2_USE_ANGLE=0.
 sed -i '' "s/Q2_USE_ANGLE=__ANGLE__/Q2_USE_ANGLE=${Q2_ANGLE:-1}/" "$OUT"
 echo "wrote $OUT (Q2_USE_ANGLE=${Q2_ANGLE:-1})"
+# Q2_DEV_BUILD: a 4-component MARKETING_VERSION (3 dots, e.g. 1.0.8.2) is an OTA-only dev build →
+# dev features (remote console) compile in; a 3-component release version → 0, they compile out.
+MV="$(grep -m1 'MARKETING_VERSION:' "$OUT" | sed 's/.*"\(.*\)".*/\1/')"
+NDOT="$(printf '%s' "$MV" | tr -cd '.' | wc -c | tr -d ' ')"
+DEV=0; [ "${NDOT:-0}" -ge 3 ] && DEV=1
+sed -i '' "s/Q2_DEV_BUILD=__DEV__/Q2_DEV_BUILD=${DEV}/" "$OUT"
+echo "wrote $OUT (Q2_DEV_BUILD=${DEV}, version ${MV})"
 
 # (Q2_SIM is handled at the END of this script so it composes with the visionOS
 # retargets below — it must rewrite the FINAL dep paths.)

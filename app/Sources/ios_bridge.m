@@ -49,9 +49,60 @@ bool VID_iOS_IsAction(void)
     return fs_game && !Q_stricmp(fs_game->string, "action");
 }
 
+// ---- Touch layout editor console seams (shell implementation in main.m) --------
+extern void Q2_iOS_ToggleLayoutEdit(void);
+extern void Q2_iOS_ResetLayout(void);
+extern void Q2_iOS_LayoutDescription(char *out, int outsz);
+extern int  Q2_iOS_FakeTouch(float nx, float ny, int phase);
+extern void Q2_iOS_PresentSettings(void);   // native iOS settings panel (ios_settings_ui.m)
+extern void Q2_iOS_RemoteConsole(int on);   // dev-only tailnet console (ios_remote_console.m; no-op in public)
+
+// q2_rcon <0|1> — start/stop the remote console (same as the settings toggle). No-op in a public
+// build (Q2_DEV_BUILD=0). Handy for enabling it headlessly on the sim.
+static void Rcon_f(void)
+{
+    if (Cmd_Argc() < 2) { Com_Printf("usage: q2_rcon <0|1>\n"); return; }
+    Q2_iOS_RemoteConsole(atoi(Cmd_Argv(1)));
+}
+
+// Opens the native UIKit iOS settings panel. The engine "iOS settings" menu entry runs this,
+// and a gear button in the touch chrome does too — decoupled from the fragile .menu system.
+static void IOSSettings_f(void) { Q2_iOS_PresentSettings(); }
+
+// touchedit [reset|print] — toggle the on-screen layout editor; `reset` restores shipped
+// positions; `print` dumps the live layout in the exact form the defaults table takes, so a
+// layout arranged on the device can be promoted to source defaults without transcribing.
+static void TouchEdit_f(void)
+{
+    if (Cmd_Argc() == 2 && !Q_stricmp(Cmd_Argv(1), "reset")) { Q2_iOS_ResetLayout(); return; }
+    if (Cmd_Argc() == 2 && !Q_stricmp(Cmd_Argv(1), "print")) {
+        char desc[2048] = {0};
+        Q2_iOS_LayoutDescription(desc, sizeof(desc));
+        Com_Printf("%s", desc);
+        return;
+    }
+    Q2_iOS_ToggleLayoutEdit();
+}
+
+// q2_faketouch <x 0..1> <y 0..1> <down|move|up|zone> — synthetic finger for the editor.
+// Injected UIKit touches never reach the touch path on the simulator, so this drives the SAME
+// editDrag* methods a real finger does; `zone` queries the move-zone hit test (the only part
+// of an invisible zone a screenshot can't prove).
+static void FakeTouch_f(void)
+{
+    if (Cmd_Argc() != 4) { Com_Printf("usage: q2_faketouch <x 0..1> <y 0..1> <down|move|up|zone>\n"); return; }
+    const char *ph = Cmd_Argv(3);
+    int phase = !Q_stricmp(ph, "down") ? 0 : !Q_stricmp(ph, "move") ? 1 : !Q_stricmp(ph, "zone") ? 3 : 2;
+    Q2_iOS_FakeTouch((float)atof(Cmd_Argv(1)), (float)atof(Cmd_Argv(2)), phase);
+}
+
 void VID_iOS_RegisterCvars(void)
 {
     Cmd_AddCommand("game_apply", GameApply_f);
+    Cmd_AddCommand("touchedit", TouchEdit_f);       // customizable touch layout editor
+    Cmd_AddCommand("q2_faketouch", FakeTouch_f);     // headless editor test seam
+    Cmd_AddCommand("ios_settings", IOSSettings_f);   // native iOS settings panel
+    Cmd_AddCommand("q2_rcon", Rcon_f);               // remote console on/off (dev builds)
     c_sens_x      = Cvar_Get("ios_sens_x",     "3",   CVAR_ARCHIVE);
     c_sens_y      = Cvar_Get("ios_sens_y",     "3",   CVAR_ARCHIVE);
     c_invert_y    = Cvar_Get("ios_invert_y",   "0",   CVAR_ARCHIVE);
@@ -63,6 +114,9 @@ void VID_iOS_RegisterCvars(void)
     c_fps         = Cvar_Get("ios_fps",        "0",   CVAR_ARCHIVE);
     c_gyro        = Cvar_Get("ios_gyro",       "0",   CVAR_ARCHIVE);
 }
+
+// Generic cvar read for the native iOS settings panel (it writes via VID_iOS_Command "set ...").
+float VID_iOS_CvarValue(const char *name) { return Cvar_VariableValue(name); }
 
 float VID_iOS_SensX(void)     { return c_sens_x     ? c_sens_x->value     : 3; }
 float VID_iOS_SensY(void)     { return c_sens_y     ? c_sens_y->value     : 3; }

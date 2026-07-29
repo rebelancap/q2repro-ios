@@ -89,18 +89,69 @@ static const CGFloat STICK_RADIUS = 70;   // visual joystick base radius
 
 // ---- CAEAGLLayer-backed view + touch input ---------------------------------
 @interface GLView : UIView
+// Touch-layout editor entry points (also reached from ios_bridge.m via the C seams below).
+- (void)ensureButtons;
+- (void)ensureLayoutLoaded;
+- (void)toggleEditing;
+- (void)beginEditingLayout;
+- (void)endEditingLayout;
+- (void)resetLayoutToDefaults;
+- (BOOL)isEditingLayout;
+- (NSString *)layoutDescription;
+- (BOOL)fakeTouchAt:(CGPoint)nrm phase:(int)phase;
 @end
+
+// ---- Touch layout persistence (NSUserDefaults, "q2." namespace) --------------
+// Per-control positions live in NSUserDefaults (like the 3D panel settings), NOT
+// engine cvars: the shell already reads/writes user defaults, and it avoids per-
+// button cvar plumbing. The GLOBAL scale stays the existing ios_touch_scale cvar
+// (read every frame by updateTouchUI), so the editor slider just writes that live.
+// q2.layoutSet records whether the user has customised anything at all — while it
+// is 0, new shipped defaults apply; once the user drags one control it flips to 1
+// and every control reads its saved position (per-key default = its shipped one).
+static float Q2Def_f(NSString *key, float def) {
+    NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
+    return [d objectForKey:key] ? [d floatForKey:key] : def;
+}
+static void Q2Def_setf(NSString *key, float v) { [NSUserDefaults.standardUserDefaults setFloat:v forKey:key]; }
+static NSString *Q2BtnKeyX(NSString *ident) { return [NSString stringWithFormat:@"q2.btn.%@.x", ident]; }
+static NSString *Q2BtnKeyY(NSString *ident) { return [NSString stringWithFormat:@"q2.btn.%@.y", ident]; }
+static NSString * const Q2LayoutSetKey = @"q2.layoutSet";
+
+// The move stick is a ZONE, not a position: a draggable activation circle (ident
+// "stick"), invisible in play (the stick floats to wherever the thumb lands) and
+// drawn at its true radius in the editor so what you drag is exactly what responds.
+static const CGFloat STICK_ZONE_DIAMETER = 300;
+
+// Weak ref to the live touch view so the console seams (touchedit / q2_faketouch,
+// registered engine-side in ios_bridge.m) reach the editor without a singleton.
+static __weak GLView *g_touchView;
+
 @implementation GLView {
     UITouch *_moveTouch, *_lookTouch;
     CGPoint _moveOrigin, _lookLast;
     UIView *_stickBase, *_stickKnob;   // visual floating joystick
-    NSMutableArray<NSDictionary *> *_btns;   // touch buttons: btn, ux, uy, sz, key/cmd, hap
+    // Each entry: b (UIButton, absent for the zone), id (stable ident, = save key),
+    // defx/defy (shipped default unit), ux/uy (effective unit), sz (base pt), + flags
+    // act/actgame/noaction (context) and zone (the move-stick activation circle).
+    NSMutableArray<NSMutableDictionary *> *_btns;
     UIButton *_backBtn;                // menu-only BACK (arrow)
+    UIButton *_gearBtn;                // menu-only gear → native iOS settings panel
+    UIButton *_qsaveBtn, *_qloadBtn;   // quick save / quick load (menu chrome, live SP game only)
     UIView *_touchCursor;             // menu-only "where you tapped" crosshair ring+dot
     UIButton *_wheelBtn;              // context button: wheel (Quake 2) / WPN (Action)
     int _wheelIsAction;               // -1 unknown; tracks _wheelBtn's current mode
     id _haptic;   // UIImpactFeedbackGenerator on iOS; nil on visionOS (no haptics)
     CGSize _lastDrawPx;   // last drawable pixel size, to fire VID_iOS_Resize only on real change
+    // ---- touch layout editor ----
+    BOOL _editing;                     // layout edit mode active
+    BOOL _layoutLoaded;                // saved positions pulled into _btns once
+    NSMutableDictionary *_dragBtn;     // control under the editing finger (nil = none)
+    CGSize _dragOffset;                // finger→center delta, so a grab doesn't jump
+    NSMutableDictionary *_stickZoneD;  // the move-zone entry in _btns (ident "stick")
+    UIView *_stickZoneView;            // faint circle at the zone's true radius (editor only)
+    UIView *_editBar;                  // editor chrome bar (reset · scale slider · done)
+    UISlider *_editSlider; UILabel *_editPct;
 }
 + (Class)layerClass {
 #if defined(Q2_USE_ANGLE) && Q2_USE_ANGLE
@@ -170,6 +221,7 @@ static const CGFloat STICK_RADIUS = 70;   // visual joystick base radius
 }
 
 - (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)e {
+    if (_editing) { [self editDragBegin:[touches.anyObject locationInView:self]]; return; }
     // Attract sequence: tap skips the intro cinematic / opens the menu over the demo.
     int ps = VID_iOS_PassiveState();
     if (ps == 2) { VID_iOS_SkipCinematic(); return; }                       // tap skips the intro
@@ -188,21 +240,23 @@ static const CGFloat STICK_RADIUS = 70;   // visual joystick base radius
     if (_moveTouch && ![active containsObject:_moveTouch]) { _moveTouch = nil; CL_SetAnalogMove(0,0); [self hideStick]; }
 
     if (GCController.controllers.count > 0) return;   // gamepad connected → ignore touch move/look
-    CGFloat midx = self.bounds.size.width / 2;
     for (UITouch *t in touches) {
         CGPoint p = [t locationInView:self];
-        if (p.x < midx && !_moveTouch)      { _moveTouch = t; _moveOrigin = p; [self showStickAt:p]; }
-        else if (p.x >= midx && !_lookTouch) { _lookTouch = t; _lookLast = p; }
+        // The move stick is a ZONE, not the left half: a touch inside the (draggable) zone
+        // circle floats the stick to the finger; anything else becomes the look drag.
+        if ([self pointInMoveZone:p] && !_moveTouch) { _moveTouch = t; _moveOrigin = p; [self showStickAt:p]; }
+        else if (!_lookTouch)                        { _lookTouch = t; _lookLast = p; }
     }
 }
 
 - (void)touchesMoved:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)e {
+    if (_editing) { [self editDragMove:[touches.anyObject locationInView:self]]; return; }
     if (VID_iOS_MenuActive()) { [self menuTouch:touches.anyObject]; return; }
-    CGFloat midx = self.bounds.size.width / 2;
     for (UITouch *t in touches) {
         CGPoint p = [t locationInView:self];
-        // Re-acquire look if our reference was lost while the finger is still down.
-        if (t != _moveTouch && t != _lookTouch && !_lookTouch && p.x >= midx) {
+        // Re-acquire look if our reference was lost while the finger is still down (and it's
+        // not in the move zone — that would be a move touch).
+        if (t != _moveTouch && t != _lookTouch && !_lookTouch && ![self pointInMoveZone:p]) {
             _lookTouch = t; _lookLast = p;   // re-anchor; no delta this frame
         }
         if (t == _moveTouch) {
@@ -223,6 +277,7 @@ static const CGFloat STICK_RADIUS = 70;   // visual joystick base radius
 }
 
 - (void)endTouches:(NSSet<UITouch *> *)touches {
+    if (_editing) { [self editDragEnd]; return; }
     if (VID_iOS_MenuActive()) { VID_iOS_MenuKey(IOS_MENU_CLICK, NO); return; }
     for (UITouch *t in touches) {
         if (t == _moveTouch) {
@@ -245,9 +300,18 @@ static const CGFloat STICK_RADIUS = 70;   // visual joystick base radius
 - (UIButton *)makePad:(NSString *)label {
     UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
     if ([label hasPrefix:@"sf:"]) {
-        UIImage *img = [UIImage systemImageNamed:[label substringFromIndex:3]];
-        [b setImage:img forState:UIControlStateNormal];
-        b.adjustsImageWhenHighlighted = NO;
+        // "sf:<symbol>[|<fallback text>]" — glyph on the button, with a word fallback
+        // if systemImageNamed: returns nil, so an unknown symbol never ships a blank
+        // circle (§8). scope/arrow.up/arrow.down are iOS 13+, so this is belt-and-braces.
+        NSArray *parts = [[label substringFromIndex:3] componentsSeparatedByString:@"|"];
+        UIImage *img = [UIImage systemImageNamed:parts.firstObject];
+        if (img) {
+            [b setImage:img forState:UIControlStateNormal];
+            b.adjustsImageWhenHighlighted = NO;
+        } else {
+            [b setTitle:(parts.count > 1 ? parts[1] : parts.firstObject) forState:UIControlStateNormal];
+            b.titleLabel.font = [UIFont boldSystemFontOfSize:15];
+        }
     } else {
         [b setTitle:label forState:UIControlStateNormal];
         b.titleLabel.font = [UIFont boldSystemFontOfSize:15];
@@ -264,19 +328,30 @@ static const CGFloat STICK_RADIUS = 70;   // visual joystick base radius
 #if !TARGET_OS_VISION
     _haptic = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
 #endif
+    // Every control carries a stable IDENT — the NSUserDefaults save key. Renaming one
+    // silently resets that control for existing users, so idents are frozen. defx/defy
+    // are the shipped defaults (used for Reset + as each key's fallback); ux/uy are the
+    // effective position (overwritten from saved layout in ensureLayoutLoaded).
+    NSMutableDictionary* (^add)(UIButton *, NSString *, CGFloat, CGFloat, CGFloat) =
+      ^NSMutableDictionary *(UIButton *b, NSString *ident, CGFloat ux, CGFloat uy, CGFloat sz) {
+        NSMutableDictionary *d = [@{@"b":b, @"id":ident, @"defx":@(ux), @"defy":@(uy),
+                                    @"ux":@(ux), @"uy":@(uy), @"sz":@(sz)} mutableCopy];
+        [_btns addObject:d];
+        return d;
+    };
     // Hold button that sends a raw command on down/up (works in BOTH the rerelease AND the
     // classic Action game — unlike KEX virtual keys, which only resolve via rerelease binds,
     // so fire/jump/crouch were dead in Action).
-    void (^cmdhold)(NSString *, CGFloat, CGFloat, CGFloat, SEL, SEL) = ^(NSString *l, CGFloat ux, CGFloat uy, CGFloat sz, SEL down, SEL up) {
+    void (^cmdhold)(NSString *, NSString *, CGFloat, CGFloat, CGFloat, SEL, SEL) = ^(NSString *l, NSString *ident, CGFloat ux, CGFloat uy, CGFloat sz, SEL down, SEL up) {
         UIButton *b = [self makePad:l];
         [b addTarget:self action:down forControlEvents:UIControlEventTouchDown];
         [b addTarget:self action:up forControlEvents:UIControlEventTouchUpInside|UIControlEventTouchUpOutside|UIControlEventTouchCancel];
-        [_btns addObject:@{@"b":b, @"ux":@(ux), @"uy":@(uy), @"sz":@(sz)}];
+        add(b, ident, ux, uy, sz);
     };
-    void (^tap)(NSString *, CGFloat, CGFloat, CGFloat, SEL) = ^(NSString *l, CGFloat ux, CGFloat uy, CGFloat sz, SEL s) {
+    void (^tap)(NSString *, NSString *, CGFloat, CGFloat, CGFloat, SEL) = ^(NSString *l, NSString *ident, CGFloat ux, CGFloat uy, CGFloat sz, SEL s) {
         UIButton *b = [self makePad:l];
         [b addTarget:self action:s forControlEvents:UIControlEventTouchUpInside];
-        [_btns addObject:@{@"b":b, @"ux":@(ux), @"uy":@(uy), @"sz":@(sz)}];
+        add(b, ident, ux, uy, sz);
     };
     // EXACT Fable layout (ios/shell/Q2TouchControls.m): unit fractions of the safe-area
     // rect, sizes in points. The top-right action button is context-sensitive: the weapon
@@ -286,47 +361,347 @@ static const CGFloat STICK_RADIUS = 70;   // visual joystick base radius
     [_wheelBtn addTarget:self action:@selector(wheelDrag:forEvent:) forControlEvents:UIControlEventTouchDragInside|UIControlEventTouchDragOutside];
     [_wheelBtn addTarget:self action:@selector(wheelUp:) forControlEvents:UIControlEventTouchUpInside|UIControlEventTouchUpOutside|UIControlEventTouchCancel];
     _wheelIsAction = -1;
-    [_btns addObject:@{@"b":_wheelBtn, @"ux":@(0.905), @"uy":@(0.30), @"sz":@(56)}];
+    add(_wheelBtn, @"wheel", 0.939, 0.304, 56);   // defaults promoted from a device-tuned layout (2026-07-29)
     // Item/powerup wheel (Quake II only), to the LEFT of the weapon wheel. Hold to open, drag to
     // select, release to pick — renders centred on this button (+wheel2 / -wheel2).
     UIButton *itemBtn = [self makePad:@"sf:bag.fill"];
     [itemBtn addTarget:self action:@selector(itemDown:) forControlEvents:UIControlEventTouchDown];
     [itemBtn addTarget:self action:@selector(wheelDrag:forEvent:) forControlEvents:UIControlEventTouchDragInside|UIControlEventTouchDragOutside];
     [itemBtn addTarget:self action:@selector(itemUp:) forControlEvents:UIControlEventTouchUpInside|UIControlEventTouchUpOutside|UIControlEventTouchCancel];
-    [_btns addObject:@{@"b":itemBtn, @"ux":@(0.825), @"uy":@(0.30), @"sz":@(52), @"noaction":@(1)}];
-    cmdhold(@"JMP",  0.955, 0.45, 60, @selector(jumpDown), @selector(jumpUp));
-    cmdhold(@"FIRE", 0.895, 0.72, 76, @selector(fireCmdDown), @selector(fireCmdUp));
-    cmdhold(@"CRO",  0.80,  0.96, 52, @selector(crouchDown), @selector(crouchUp));
-    tap(@"sf:line.3.horizontal", 0.97,  0.09, 40, @selector(padMenu));     // menu (hamburger)
-    tap(@"sf:list.number",       0.905, 0.09, 44, @selector(padScores));   // objectives / scoreboard
+    add(itemBtn, @"item", 0.839, 0.308, 52)[@"noaction"] = @(1);
+    // Action buttons carry GLYPHS with a word fallback (§8): fire=scope, jump=arrow.up, crouch=arrow.down.
+    cmdhold(@"sf:arrow.up|JMP",    @"jump",   0.985, 0.503, 60, @selector(jumpDown), @selector(jumpUp));
+    cmdhold(@"sf:scope|FIRE",      @"fire",   0.909, 0.719, 76, @selector(fireCmdDown), @selector(fireCmdUp));
+    cmdhold(@"sf:arrow.down|CRO",  @"crouch", 0.986, 0.920, 52, @selector(crouchDown), @selector(crouchUp));
+    tap(@"sf:line.3.horizontal", @"menu",   0.97,  0.09, 40, @selector(padMenu));     // menu (hamburger)
+    tap(@"sf:list.number",       @"scores", 0.905, 0.09, 44, @selector(padScores));   // objectives / scoreboard
 
     // Action-only in-game menu nav (join team / loadout are game-drawn LAYOUT_MENU menus,
     // navigated by invprev/invnext/invuse — not clickable). Shown only while Action is active.
-    void (^actbtn)(NSString *, CGFloat, CGFloat, CGFloat, SEL) = ^(NSString *l, CGFloat ux, CGFloat uy, CGFloat sz, SEL s) {
+    void (^actbtn)(NSString *, NSString *, CGFloat, CGFloat, CGFloat, SEL) = ^(NSString *l, NSString *ident, CGFloat ux, CGFloat uy, CGFloat sz, SEL s) {
         UIButton *b = [self makePad:l];
         [b addTarget:self action:s forControlEvents:UIControlEventTouchUpInside];
-        [_btns addObject:@{@"b":b, @"ux":@(ux), @"uy":@(uy), @"sz":@(sz), @"act":@(1)}];
+        add(b, ident, ux, uy, sz)[@"act"] = @(1);
     };
-    actbtn(@"sf:chevron.up",   0.055, 0.30, 44, @selector(actInvPrev));
-    actbtn(@"sf:chevron.down", 0.055, 0.52, 44, @selector(actInvNext));
-    actbtn(@"OK",              0.055, 0.74, 44, @selector(actInvUse));
+    actbtn(@"sf:chevron.up",   @"actprev", 0.055, 0.30, 44, @selector(actInvPrev));
+    actbtn(@"sf:chevron.down", @"actnext", 0.055, 0.52, 44, @selector(actInvNext));
+    actbtn(@"OK",              @"actuse",  0.055, 0.74, 44, @selector(actInvUse));
     // Action-only gameplay buttons ("actgame"): shown in Action when no game menu is up.
     // Top-left: (re)open the team/loadout menu. Right of FIRE: sniper zoom (cmd lens in cycles 1/2/4/6×).
     UIButton *recall = [self makePad:@"sf:person.2.fill"];
     [recall addTarget:self action:@selector(actMenuRecall) forControlEvents:UIControlEventTouchUpInside];
-    [_btns addObject:@{@"b":recall, @"ux":@(0.055), @"uy":@(0.09), @"sz":@(44), @"actgame":@(1)}];
+    add(recall, @"actmenu", 0.055, 0.09, 44)[@"actgame"] = @(1);
     UIButton *zoom = [self makePad:@"Z+"];
     [zoom addTarget:self action:@selector(actZoom) forControlEvents:UIControlEventTouchUpInside];
-    [_btns addObject:@{@"b":zoom, @"ux":@(0.985), @"uy":@(0.60), @"sz":@(52), @"actgame":@(1)}];
+    add(zoom, @"actzoom", 0.985, 0.60, 52)[@"actgame"] = @(1);
+
+    // Move-stick ZONE (ident "stick"): a draggable activation circle, not a button. It has no
+    // UIButton, so it is naturally excluded from gameplay button hit-testing; the editor grabs
+    // it and draws _stickZoneView at its true radius. Default centre reproduces the old left zone.
+    _stickZoneView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, STICK_ZONE_DIAMETER, STICK_ZONE_DIAMETER)];
+    _stickZoneView.backgroundColor = [UIColor colorWithWhite:1 alpha:0.05];
+    _stickZoneView.layer.cornerRadius = STICK_ZONE_DIAMETER / 2;
+    _stickZoneView.layer.borderWidth = 2;
+    _stickZoneView.layer.borderColor = [UIColor colorWithRed:1 green:0.85 blue:0.4 alpha:0.5].CGColor;
+    _stickZoneView.userInteractionEnabled = NO; _stickZoneView.hidden = YES;
+    [self addSubview:_stickZoneView];
+    _stickZoneD = [@{@"id":@"stick", @"zone":@(1), @"defx":@(0.162), @"defy":@(0.666),
+                     @"ux":@(0.162), @"uy":@(0.666), @"sz":@(STICK_ZONE_DIAMETER)} mutableCopy];
+    [_btns addObject:_stickZoneD];
 
     _backBtn = [self makePad:@"sf:arrowshape.turn.up.backward.fill"];   // menu-only back arrow
     [_backBtn addTarget:self action:@selector(padBack) forControlEvents:UIControlEventTouchUpInside];
     _backBtn.hidden = YES;
+    _gearBtn = [self makePad:@"sf:gearshape.fill"];   // menu-only → native iOS settings panel
+    [_gearBtn addTarget:self action:@selector(padSettings) forControlEvents:UIControlEventTouchUpInside];
+    _gearBtn.hidden = YES;
+    // Quick save / load — menu chrome (NOT part of the customizable layout), shown only while a
+    // live single-player game is paused in a menu. Under the back/gear row, on the left.
+    _qsaveBtn = [self makePad:@"SAVE"];
+    [_qsaveBtn addTarget:self action:@selector(padQuickSave) forControlEvents:UIControlEventTouchUpInside];
+    _qsaveBtn.hidden = YES;
+    _qloadBtn = [self makePad:@"LOAD"];
+    [_qloadBtn addTarget:self action:@selector(padQuickLoad) forControlEvents:UIControlEventTouchUpInside];
+    _qloadBtn.hidden = YES;
 
     UITapGestureRecognizer *g = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(twoFingerBack:)];
     g.numberOfTouchesRequired = 2; g.cancelsTouchesInView = NO;
     [self addGestureRecognizer:g];
 }
+// ==================== Customizable touch layout (editor) =====================
+// Model: each control has an ident; positions persist to NSUserDefaults (q2.btn.<id>.x/y)
+// gated by q2.layoutSet; the global scale is the ios_touch_scale cvar. The move stick is a
+// draggable ZONE (ident "stick"), lefty is gone (migrated once). Console seams: touchedit /
+// touchedit reset|print / q2_faketouch drive the SAME editDrag* methods a real finger does.
+
+// Pull saved positions into _btns once (and migrate legacy lefty users on the way).
+- (void)ensureLayoutLoaded {
+    if (_layoutLoaded) return;
+    _layoutLoaded = YES;
+    // One-time migration for anyone who had the old "lefty touch layout" cvar on. That toggle
+    // is gone — the editor plus the draggable move zone replace it — so bake the mirror it used
+    // to apply at layout time into saved positions (buttons AND the stick zone, both in _btns)
+    // so their whole scheme doesn't jump across the screen on update. Guarded by layoutSet<0.5
+    // so it never clobbers someone who has already arranged their own layout.
+    if (VID_iOS_TouchLefty() && Q2Def_f(Q2LayoutSetKey, 0.0f) < 0.5f) {
+        for (NSMutableDictionary *d in _btns) {
+            Q2Def_setf(Q2BtnKeyX(d[@"id"]), 1.0f - [d[@"defx"] doubleValue]);
+            Q2Def_setf(Q2BtnKeyY(d[@"id"]), [d[@"defy"] doubleValue]);
+        }
+        Q2Def_setf(Q2LayoutSetKey, 1.0f);
+        NSLog(@"[q2repro] migrated legacy lefty layout into a saved custom layout");
+    }
+    [self loadLayoutPositions];
+}
+// Effective position for every control: the saved one if the layout is customised, else its
+// shipped default. Per-key default is still defx/defy, so a control that was never individually
+// dragged lands on its default even in custom mode (two-level fallback, deliberate).
+- (void)loadLayoutPositions {
+    BOOL custom = Q2Def_f(Q2LayoutSetKey, 0.0f) > 0.5f;
+    for (NSMutableDictionary *d in _btns) {
+        if (custom) {
+            d[@"ux"] = @(Q2Def_f(Q2BtnKeyX(d[@"id"]), [d[@"defx"] doubleValue]));
+            d[@"uy"] = @(Q2Def_f(Q2BtnKeyY(d[@"id"]), [d[@"defy"] doubleValue]));
+        } else {
+            d[@"ux"] = d[@"defx"]; d[@"uy"] = d[@"defy"];
+        }
+    }
+}
+- (void)resetLayoutToDefaults {
+    [self ensureButtons];   // "touchedit reset" can arrive before the first frame built them
+    Q2Def_setf(Q2LayoutSetKey, 0.0f);
+    for (NSMutableDictionary *d in _btns) {
+        Q2Def_setf(Q2BtnKeyX(d[@"id"]), [d[@"defx"] doubleValue]);
+        Q2Def_setf(Q2BtnKeyY(d[@"id"]), [d[@"defy"] doubleValue]);
+    }
+    VID_iOS_Command("set ios_touch_scale 1.0");   // the scale is part of the layout now
+    [self loadLayoutPositions];
+}
+
+// Which controls are relevant to the current game context (ignores menu/pad/passive — the
+// editor forces them visible). Same rules as updateTouchUI's per-frame hide logic.
+- (BOOL)controlShownInContext:(NSDictionary *)d isAction:(BOOL)isAct layoutUp:(BOOL)layoutUp {
+    if ([d[@"zone"] boolValue])     return YES;                 // move zone: editable (drawn only while editing)
+    if ([d[@"actgame"] boolValue])  return isAct && !layoutUp;
+    if ([d[@"noaction"] boolValue]) return !isAct;
+    if ([d[@"act"] boolValue])      return isAct && layoutUp;
+    return YES;                                                 // core controls
+}
+- (UIView *)viewFor:(NSDictionary *)d { return [d[@"zone"] boolValue] ? _stickZoneView : d[@"b"]; }
+- (CGPoint)centerOf:(NSDictionary *)d {
+    CGRect r = UIEdgeInsetsInsetRect(self.bounds, self.safeAreaInsets);
+    return CGPointMake(r.origin.x + [d[@"ux"] doubleValue] * r.size.width,
+                       r.origin.y + [d[@"uy"] doubleValue] * r.size.height);
+}
+// Grab the SMALLEST control under the finger, so a small button inside the big stick circle
+// stays grabbable. Only controls relevant to the current context are grabbable.
+- (NSMutableDictionary *)placeableAt:(CGPoint)p {
+    CGRect r = UIEdgeInsetsInsetRect(self.bounds, self.safeAreaInsets);
+    if (r.size.width <= 0 || r.size.height <= 0) return nil;
+    CGFloat scale = VID_iOS_TouchScale();
+    int isAct = VID_iOS_IsAction() ? 1 : 0; BOOL layoutUp = VID_iOS_LayoutActive();
+    NSMutableDictionary *best = nil; CGFloat bestSz = 1e9;
+    for (NSMutableDictionary *d in _btns) {
+        if (![self controlShownInContext:d isAction:isAct layoutUp:layoutUp]) continue;
+        CGFloat sz = [d[@"sz"] doubleValue] * scale;
+        CGFloat cx = r.origin.x + [d[@"ux"] doubleValue] * r.size.width;
+        CGFloat cy = r.origin.y + [d[@"uy"] doubleValue] * r.size.height;
+        CGFloat hit = sz * 0.5 * ([d[@"zone"] boolValue] ? 1.0 : 1.3);   // zone = true radius; buttons generous
+        CGFloat dx = p.x - cx, dy = p.y - cy;
+        if (dx * dx + dy * dy <= hit * hit && sz < bestSz) { best = d; bestSz = sz; }
+    }
+    return best;
+}
+// Gameplay move-zone hit test (the single source of truth for "this touch starts movement").
+- (BOOL)pointInMoveZone:(CGPoint)p {
+    if (!_stickZoneD) return p.x < self.bounds.size.width * 0.5;   // pre-build fallback = old left half
+    CGRect r = UIEdgeInsetsInsetRect(self.bounds, self.safeAreaInsets);
+    CGFloat cx = r.origin.x + [_stickZoneD[@"ux"] doubleValue] * r.size.width;
+    CGFloat cy = r.origin.y + [_stickZoneD[@"uy"] doubleValue] * r.size.height;
+    CGFloat rad = [_stickZoneD[@"sz"] doubleValue] * 0.5 * VID_iOS_TouchScale();
+    CGFloat dx = p.x - cx, dy = p.y - cy;
+    return dx * dx + dy * dy <= rad * rad;
+}
+
+// ---- Drag (real finger AND synthetic finger call these) ----
+- (BOOL)editDragBegin:(CGPoint)p {
+    _dragBtn = [self placeableAt:p];
+    if (!_dragBtn) return NO;
+    CGPoint c = [self centerOf:_dragBtn];
+    _dragOffset = CGSizeMake(c.x - p.x, c.y - p.y);   // so the control doesn't jump to the fingertip
+    UIView *v = [self viewFor:_dragBtn];
+    v.backgroundColor = [UIColor colorWithRed:1 green:0.85 blue:0.4 alpha:0.45];
+    return YES;
+}
+- (void)editDragMove:(CGPoint)p {
+    if (!_dragBtn) return;
+    // Only constraint: the CENTRE stays on screen so anything placed can be grabbed again.
+    // Deliberately NOT the safe rect and NOT inset by the radius (that refused positions the
+    // controls ship at — jump defaults near x 0.99). Overshoot is cheap; Reset is right there.
+    CGFloat cx = fmax(0, fmin(self.bounds.size.width,  p.x + _dragOffset.width));
+    CGFloat cy = fmax(0, fmin(self.bounds.size.height, p.y + _dragOffset.height));
+    [self viewFor:_dragBtn].center = CGPointMake(cx, cy);
+}
+- (void)editDragEnd {
+    if (!_dragBtn) return;
+    CGRect r = UIEdgeInsetsInsetRect(self.bounds, self.safeAreaInsets);
+    UIView *v = [self viewFor:_dragBtn];
+    if (v && r.size.width > 0 && r.size.height > 0) {
+        // Normalize the raw-bounds center against the SAFE-AREA rect — asymmetric with the
+        // clamp above ON PURPOSE, so edge controls keep their >1 / <0 shipped unit positions.
+        CGFloat ux = (v.center.x - r.origin.x) / r.size.width;
+        CGFloat uy = (v.center.y - r.origin.y) / r.size.height;
+        _dragBtn[@"ux"] = @(ux); _dragBtn[@"uy"] = @(uy);
+        Q2Def_setf(Q2BtnKeyX(_dragBtn[@"id"]), ux);
+        Q2Def_setf(Q2BtnKeyY(_dragBtn[@"id"]), uy);
+        Q2Def_setf(Q2LayoutSetKey, 1.0f);
+        NSLog(@"[q2repro] layout: %@ -> (%.3f, %.3f)", _dragBtn[@"id"], ux, uy);
+    }
+    v.backgroundColor = [_dragBtn[@"zone"] boolValue] ? [UIColor colorWithWhite:1 alpha:0.05]
+                                                      : [UIColor colorWithWhite:1 alpha:0.14];
+    _dragBtn = nil;
+}
+
+// Release every in-flight input so entering edit mode never leaves a key/button asserted.
+- (void)releaseAllInput {
+    _moveTouch = nil; _lookTouch = nil;
+    CL_SetAnalogMove(0, 0);
+    [self hideStick];
+    VID_iOS_Command("-attack"); VID_iOS_Command("-moveup"); VID_iOS_Command("-movedown");
+    VID_iOS_Command("-wheel2");
+    VID_iOS_KeyEvent(K_RIGHT_SHOULDER, NO);   // weapon wheel (+wheel) off
+    VID_iOS_LookAnalog(0, 0);
+}
+
+- (BOOL)isEditingLayout { return _editing; }
+- (void)toggleEditing { if (_editing) [self endEditingLayout]; else [self beginEditingLayout]; }
+- (void)beginEditingLayout {
+    if (_editing) return;
+    [self ensureButtons];
+    [self ensureLayoutLoaded];
+    _editing = YES;
+    [self releaseAllInput];
+    VID_iOS_Command("forcemenuoff");   // judge placement against the game, not a menu backdrop
+    for (NSMutableDictionary *d in _btns) {
+        UIButton *b = d[@"b"];
+        if (!b) continue;
+        b.userInteractionEnabled = NO;   // route drags to GLView.touchesBegan, not the button's action
+        b.layer.borderColor = [UIColor colorWithRed:1 green:0.85 blue:0.4 alpha:0.95].CGColor;
+    }
+    [self buildEditChrome];
+    NSLog(@"[q2repro] touch layout editor entered");
+}
+- (void)endEditingLayout {
+    if (!_editing) return;
+    [self editDragEnd];   // commit anything still under the finger
+    _editing = NO;
+    for (NSMutableDictionary *d in _btns) {
+        UIButton *b = d[@"b"];
+        if (!b) continue;
+        b.userInteractionEnabled = YES;
+        b.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.22].CGColor;
+    }
+    _stickZoneView.hidden = YES;
+    [_editBar removeFromSuperview]; _editBar = nil; _editSlider = nil; _editPct = nil;
+    NSLog(@"[q2repro] touch layout editor exited");
+}
+
+// Chrome: reset · live scale slider (% above) · done — bottom-left, 42pt, Shipwright's layout.
+// No instruction text: once you are here, dragging a button is self-evident.
+- (void)buildEditChrome {
+    UIView *bar = [[UIView alloc] initWithFrame:CGRectZero];
+    bar.translatesAutoresizingMaskIntoConstraints = NO;
+    [self addSubview:bar]; _editBar = bar;
+
+    UIButton *reset = [UIButton buttonWithType:UIButtonTypeSystem];
+    reset.backgroundColor = [UIColor colorWithRed:0.85 green:0.20 blue:0.22 alpha:0.95];
+    [reset setImage:[[UIImage systemImageNamed:@"arrow.uturn.backward"] imageWithConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:17 weight:UIImageSymbolWeightBold]] forState:UIControlStateNormal];
+    reset.tintColor = UIColor.whiteColor; reset.layer.cornerRadius = 21;
+    [reset addTarget:self action:@selector(editResetTapped) forControlEvents:UIControlEventTouchUpInside];
+
+    UIButton *done = [UIButton buttonWithType:UIButtonTypeSystem];
+    done.backgroundColor = [UIColor colorWithRed:0.18 green:0.78 blue:0.34 alpha:0.95];
+    [done setImage:[[UIImage systemImageNamed:@"checkmark"] imageWithConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:20 weight:UIImageSymbolWeightBold]] forState:UIControlStateNormal];
+    done.tintColor = UIColor.whiteColor; done.layer.cornerRadius = 21;
+    [done addTarget:self action:@selector(endEditingLayout) forControlEvents:UIControlEventTouchUpInside];
+
+    UISlider *sl = [UISlider new];
+    sl.minimumValue = 0.6f; sl.maximumValue = 1.6f;
+    sl.value = VID_iOS_TouchScale();
+    sl.minimumTrackTintColor = [UIColor colorWithWhite:1 alpha:0.9];
+    [sl addTarget:self action:@selector(editScaleChanged:) forControlEvents:UIControlEventValueChanged];
+    _editSlider = sl;
+
+    UILabel *pct = [UILabel new];
+    pct.font = [UIFont monospacedDigitSystemFontOfSize:15 weight:UIFontWeightSemibold];
+    pct.textColor = [UIColor colorWithWhite:1 alpha:0.9]; pct.textAlignment = NSTextAlignmentCenter;
+    _editPct = pct; [self updateScaleLabel];
+
+    for (UIView *v in @[reset, done, sl, pct]) { v.translatesAutoresizingMaskIntoConstraints = NO; [bar addSubview:v]; }
+    [NSLayoutConstraint activateConstraints:@[
+        [bar.leadingAnchor constraintEqualToAnchor:self.safeAreaLayoutGuide.leadingAnchor constant:14],
+        [bar.bottomAnchor constraintEqualToAnchor:self.safeAreaLayoutGuide.bottomAnchor constant:-14],
+        [bar.heightAnchor constraintEqualToConstant:42],
+        [bar.trailingAnchor constraintEqualToAnchor:done.trailingAnchor],
+        [reset.leadingAnchor constraintEqualToAnchor:bar.leadingAnchor],
+        [reset.centerYAnchor constraintEqualToAnchor:bar.centerYAnchor],
+        [reset.widthAnchor constraintEqualToConstant:42], [reset.heightAnchor constraintEqualToConstant:42],
+        [sl.leadingAnchor constraintEqualToAnchor:reset.trailingAnchor constant:16],
+        [sl.centerYAnchor constraintEqualToAnchor:bar.centerYAnchor],
+        [sl.widthAnchor constraintEqualToConstant:220],
+        [pct.centerXAnchor constraintEqualToAnchor:sl.centerXAnchor],
+        [pct.bottomAnchor constraintEqualToAnchor:sl.topAnchor constant:-2],
+        [done.leadingAnchor constraintEqualToAnchor:sl.trailingAnchor constant:16],
+        [done.centerYAnchor constraintEqualToAnchor:bar.centerYAnchor],
+        [done.widthAnchor constraintEqualToConstant:42], [done.heightAnchor constraintEqualToConstant:42],
+    ]];
+}
+- (void)updateScaleLabel { _editPct.text = [NSString stringWithFormat:@"%.0f%%", VID_iOS_TouchScale() * 100.0f]; }
+- (void)editScaleChanged:(UISlider *)s {
+    // Write the same cvar updateTouchUI reads every frame, so buttons AND the zone resize live.
+    VID_iOS_Command([NSString stringWithFormat:@"set ios_touch_scale %.3f", s.value].UTF8String);
+    [self updateScaleLabel];
+}
+- (void)editResetTapped {
+    [self resetLayoutToDefaults];
+    _editSlider.value = VID_iOS_TouchScale();   // reset put it back to 1.0
+    [self updateScaleLabel];
+    NSLog(@"[q2repro] touch layout reset to defaults");
+}
+
+// ---- Console seams (called from ios_bridge.m command handlers on the main thread) ----
+// Dump the live layout in the exact form the defaults table takes, so a layout arranged on the
+// device can be read back and promoted to shipped defaults without transcribing by eye.
+- (NSString *)layoutDescription {
+    [self ensureButtons];        // `touchedit print` can arrive before the editor/first frame built them
+    [self ensureLayoutLoaded];   // reflect the persisted layout, not creation-time defaults
+    NSMutableString *s = [NSMutableString stringWithFormat:@"touch layout - scale %.2f, customised=%@\n",
+                          VID_iOS_TouchScale(), Q2Def_f(Q2LayoutSetKey, 0.0f) > 0.5f ? @"yes" : @"no (defaults)"];
+    for (NSMutableDictionary *d in _btns)
+        [s appendFormat:@"  %-8s size %3.0f  at CGPointMake(%.3f, %.3f)\n",
+             [d[@"id"] UTF8String], [d[@"sz"] doubleValue], [d[@"ux"] doubleValue], [d[@"uy"] doubleValue]];
+    return s;
+}
+// Synthetic finger: injected UIKit touches never reach the touch path on the sim, so this drives
+// the SAME editDrag* methods a real finger does. phase 0 down / 1 move / 2 up / 3 zone-query.
+- (BOOL)fakeTouchAt:(CGPoint)nrm phase:(int)phase {
+    // Map against the SAFE-AREA rect so faketouch coords match the layout's unit space (the same
+    // fractions `touchedit print` reports) — a control is grabbable at exactly its printed x,y.
+    CGRect r = UIEdgeInsetsInsetRect(self.bounds, self.safeAreaInsets);
+    CGPoint p = CGPointMake(r.origin.x + nrm.x * r.size.width, r.origin.y + nrm.y * r.size.height);
+    if (phase == 3) {   // pure query — the only part of an invisible zone a screenshot can't prove
+        BOOL in = [self pointInMoveZone:p];
+        NSLog(@"[q2repro] movezone (%.0f,%.0f) -> %@", p.x, p.y, in ? @"INSIDE" : @"outside");
+        return in;
+    }
+    if (!_editing) { NSLog(@"[q2repro] q2_faketouch ignored — layout editor is not open"); return NO; }
+    switch (phase) {
+        case 0: { BOOL g = [self editDragBegin:p]; NSLog(@"[q2repro] faketouch down (%.0f,%.0f) grabbed=%d", p.x, p.y, g); return g; }
+        case 1: [self editDragMove:p]; return YES;
+        default: [self editDragEnd]; return YES;
+    }
+}
+
 // Scale an SF-Symbol button's glyph to fill its round frame.
 - (void)sizeSymbol:(UIButton *)b to:(CGFloat)sz ratio:(CGFloat)ratio weight:(UIImageSymbolWeight)w {
     if (!b.currentImage) return;
@@ -339,7 +714,23 @@ static const CGFloat STICK_RADIUS = 70;   // visual joystick base radius
 }
 - (void)padUp:(UIButton *)b { VID_iOS_KeyEvent((int)b.tag, NO); }
 - (void)padMenu   { VID_iOS_ToggleMenu(); }
+- (void)padSettings { VID_iOS_Command("ios_settings"); }   // native iOS settings panel
 - (void)padScores { VID_iOS_Command("cmd help"); }   // help computer / objectives (the numbered list)
+// Quick save: the menu's own save path is `save <slot>; forcemenuoff`, so replicate it (a raw
+// `save` would leave the menu sitting over the game). Quick load: a bare `load` — the reconnect
+// takes the menu down on its own (mirrors the engine Load menu, which issues no forcemenuoff).
+- (void)padQuickSave { VID_iOS_Command("save quick"); VID_iOS_Command("forcemenuoff"); if (VID_iOS_Haptics()) Q2_HAPTIC(_haptic); }
+- (void)padQuickLoad { if ([self quickSaveExists]) VID_iOS_Command("load quick"); }
+// Chrome visibility: a live, interactive (non-demo/cinematic) session with a menu up. Save is
+// allowed in SP + coop and no-ops in deathmatch, so this deliberately does not gate on player count.
+- (BOOL)quickChromeAvailable { return VID_iOS_MenuActive() && !VID_iOS_Disconnected() && VID_iOS_PassiveState() == 0; }
+// Does a quicksave exist? Q2 saves are directories under <homedir>/baseq2/save/<name>/; server.ssv
+// is the marker. homedir is the profile dir (rerelease/original) — stat it live, no engine call.
+- (BOOL)quickSaveExists {
+    NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+    NSString *p = [docs stringByAppendingPathComponent:@"profile/baseq2/save/quick/server.ssv"];
+    return [NSFileManager.defaultManager fileExistsAtPath:p];
+}
 // Render the open wheel centred on the button that opened it (HUD-fraction anchor), so the
 // cursor's origin is the button. -1,-1 restores the default (right/left-of-centre) placement.
 - (void)setWheelAnchorForButton:(UIButton *)b {
@@ -398,15 +789,21 @@ static const CGFloat STICK_RADIUS = 70;   // visual joystick base radius
     if (VID_iOS_MenuActive()) { VID_iOS_MenuKey(IOS_MENU_BACK, YES); VID_iOS_MenuKey(IOS_MENU_BACK, NO); }
 }
 
-// Called each frame: position + scale/opacity/lefty + hide when a menu is up.
+// Called each frame: position + scale/opacity + hide when a menu is up. The editor rides on
+// top of this loop — while editing, hideGame is forced off (controls stay visible even over a
+// menu), the control under the finger keeps the position editDragMove gave it, and the move
+// ZONE is drawn at its true radius; scale comes from the same ios_touch_scale cvar the slider
+// writes, so resizing is live.
 - (void)updateTouchUI {
     [self ensureButtons];
+    [self ensureLayoutLoaded];
+    BOOL editing = _editing;
     CGRect r = UIEdgeInsetsInsetRect(self.bounds, self.safeAreaInsets);
     CGFloat scale = VID_iOS_TouchScale(), alpha = VID_iOS_TouchAlpha();
-    BOOL lefty = VID_iOS_TouchLefty(), inMenu = VID_iOS_MenuActive();
+    BOOL inMenu = VID_iOS_MenuActive();
     BOOL passive = VID_iOS_PassiveState() != 0;         // demo / cinematic playing
     BOOL pad = GCController.controllers.count > 0;      // a gamepad is connected
-    BOOL hideGame = inMenu || passive || pad;           // controls only during live touch play
+    BOOL hideGame = (inMenu || passive || pad) && !editing;   // controls only during live touch play (editor overrides)
     if (pad) VID_iOS_SetWheelAnchor(-1, -1);            // controller → wheel renders at default centre
     BOOL layoutUp = VID_iOS_LayoutActive();             // Action join/loadout menu on screen
     // Context button: thin weapon-wheel glyph in Quake II, "WPN" text in Action. Only reskin
@@ -423,35 +820,105 @@ static const CGFloat STICK_RADIUS = 70;   // visual joystick base radius
             [_wheelBtn setImage:[UIImage systemImageNamed:@"circle.hexagongrid"] forState:UIControlStateNormal];
         }
     }
-    for (NSDictionary *d in _btns) {
+    for (NSMutableDictionary *d in _btns) {
+        if ([d[@"zone"] boolValue]) continue;           // the move zone has no UIButton (drawn below)
         UIButton *b = d[@"b"];
-        CGFloat ux = [d[@"ux"] doubleValue], uy = [d[@"uy"] doubleValue], sz = [d[@"sz"] doubleValue] * scale;
-        if (lefty) ux = 1.0 - ux;
-        b.bounds = CGRectMake(0, 0, sz, sz);
-        b.center = CGPointMake(r.origin.x + ux * r.size.width, r.origin.y + uy * r.size.height);
-        b.layer.cornerRadius = sz / 2;
-        UIImageSymbolWeight w = (b == _wheelBtn) ? UIImageSymbolWeightLight : UIImageSymbolWeightSemibold;  // thinner wheel
-        [self sizeSymbol:b to:sz ratio:0.5 weight:w];
-        b.alpha = alpha * 0.85;
-        if ([d[@"actgame"] boolValue])
-            b.hidden = hideGame || !isAct || layoutUp;   // Action gameplay, only while no game menu is up
-        else if ([d[@"noaction"] boolValue])
-            b.hidden = hideGame || isAct;                // item wheel: Quake II only (Action has no wheels)
-        else
-            // Action menu-nav buttons appear only while Action is active AND a game layout/menu is up.
-            b.hidden = hideGame || ([d[@"act"] boolValue] && !(isAct && layoutUp));
+        CGFloat sz = [d[@"sz"] doubleValue] * scale;
+        // The control under the editing finger keeps the position editDragMove gave it.
+        if (!(editing && d == _dragBtn)) {
+            b.bounds = CGRectMake(0, 0, sz, sz);
+            b.center = CGPointMake(r.origin.x + [d[@"ux"] doubleValue] * r.size.width,
+                                   r.origin.y + [d[@"uy"] doubleValue] * r.size.height);
+            b.layer.cornerRadius = sz / 2;
+        }
+        UIImageSymbolWeight w = (b == _wheelBtn) ? UIImageSymbolWeightLight : UIImageSymbolWeightRegular;  // lighter glyphs
+        [self sizeSymbol:b to:sz ratio:0.44 weight:w];   // a touch smaller + lighter than before
+        b.alpha = editing ? 0.95 : alpha * 0.85;
+        b.hidden = ![self controlShownInContext:d isAction:isAct layoutUp:layoutUp] || (hideGame && !editing);
     }
-    if (hideGame) [self hideStick];                     // no floating stick during demo/menu
+    // Move-stick zone: faint circle at true radius while editing, invisible in play.
+    if (editing) {
+        if (_stickZoneD != _dragBtn) {
+            CGFloat zsz = [_stickZoneD[@"sz"] doubleValue] * scale;
+            _stickZoneView.bounds = CGRectMake(0, 0, zsz, zsz);
+            _stickZoneView.layer.cornerRadius = zsz / 2;
+            _stickZoneView.center = CGPointMake(r.origin.x + [_stickZoneD[@"ux"] doubleValue] * r.size.width,
+                                                r.origin.y + [_stickZoneD[@"uy"] doubleValue] * r.size.height);
+        }
+        _stickZoneView.hidden = NO;
+        [self sendSubviewToBack:_stickZoneView];        // never cover a button you want to grab
+        [self bringSubviewToFront:_editBar];            // chrome always on top
+    } else {
+        _stickZoneView.hidden = YES;
+    }
+    // The move-stick GRAPHIC is shown ONLY in the layout editor, parked in the middle of its zone
+    // circle so it's clear the circle IS the move stick. In play it stays invisible until you
+    // touch — then it floats to your thumb (touchesMoved owns it).
+    if (editing) {
+        [self ensureStick];
+        _stickBase.center = _stickKnob.center = _stickZoneView.center;   // dead-centre the zone circle
+        _stickBase.hidden = _stickKnob.hidden = NO;
+    } else if (hideGame || !_moveTouch) {
+        [self hideStick];
+    }
     CGFloat bsz = 46 * scale;                           // smaller back button
     _backBtn.bounds = CGRectMake(0, 0, bsz, bsz);
     _backBtn.center = CGPointMake(r.origin.x + bsz*0.65, r.origin.y + bsz*0.65);
     _backBtn.layer.cornerRadius = bsz / 2;
     [self sizeSymbol:_backBtn to:bsz ratio:0.4 weight:UIImageSymbolWeightRegular];   // lighter/smaller arrow
     _backBtn.alpha = alpha * 0.9;
-    _backBtn.hidden = !inMenu;
-    if (!inMenu && _touchCursor) _touchCursor.hidden = YES;   // cursor is menu-only
+    _backBtn.hidden = !inMenu || editing;               // no stray back arrow in the editor
+    // Gear → native iOS settings, just right of the back arrow (menu chrome, like back).
+    _gearBtn.bounds = CGRectMake(0, 0, bsz, bsz);
+    _gearBtn.center = CGPointMake(_backBtn.center.x + bsz*1.15, _backBtn.center.y);
+    _gearBtn.layer.cornerRadius = bsz / 2;
+    [self sizeSymbol:_gearBtn to:bsz ratio:0.42 weight:UIImageSymbolWeightRegular];
+    _gearBtn.alpha = alpha * 0.9;
+    _gearBtn.hidden = !inMenu || editing;
+    // Quick save / load — under the back/gear row, only while a live SP/coop game is paused in a
+    // menu. LOAD is a dead, dimmed button when no quicksave exists yet (the exists stat runs only
+    // while these are eligible, i.e. paused in a menu — never during gameplay frames).
+    BOOL qavail = [self quickChromeAvailable] && !editing;
+    CGFloat qsz = 48 * scale, qy = _backBtn.center.y + bsz*1.2;
+    _qsaveBtn.bounds = _qloadBtn.bounds = CGRectMake(0, 0, qsz, qsz);
+    _qsaveBtn.center = CGPointMake(_backBtn.center.x, qy);
+    _qloadBtn.center = CGPointMake(_gearBtn.center.x, qy);
+    _qsaveBtn.layer.cornerRadius = _qloadBtn.layer.cornerRadius = qsz / 2;
+    _qsaveBtn.alpha = alpha * 0.9;
+    _qsaveBtn.hidden = _qloadBtn.hidden = !qavail;
+    if (qavail) {
+        BOOL exists = [self quickSaveExists];
+        _qloadBtn.enabled = exists;
+        _qloadBtn.alpha = alpha * (exists ? 0.9 : 0.35);   // dimmed + dead when no quicksave yet
+    }
+    if ((!inMenu || editing) && _touchCursor) _touchCursor.hidden = YES;   // cursor is menu-only
 }
 @end
+
+// ---- Touch layout console seams (C ABI; handlers in ios_bridge.m call these) --
+// All run on the main thread: iOS console commands execute inside Qcommon_Frame (the display
+// link tick), the same thread UIKit lives on — so no locking is needed to touch views here.
+void Q2_iOS_ToggleLayoutEdit(void) { [g_touchView toggleEditing]; }
+void Q2_iOS_ResetLayout(void)      { [g_touchView resetLayoutToDefaults]; }   // "touchedit reset" — no editor
+// Fill out with the live layout in defaults-table form (ios_bridge.m Com_Printf's it).
+void Q2_iOS_LayoutDescription(char *out, int outsz) {
+    if (!g_touchView || outsz <= 0) { if (outsz > 0) out[0] = 0; return; }
+    strlcpy(out, g_touchView.layoutDescription.UTF8String, (size_t)outsz);
+}
+// Synthetic finger for the editor: phase 0 down / 1 move / 2 up / 3 zone-query. Returns
+// nonzero for a grabbed control (down) or an inside-zone hit (query), 0 otherwise.
+int Q2_iOS_FakeTouch(float nx, float ny, int phase) {
+    return g_touchView ? ([g_touchView fakeTouchAt:CGPointMake(nx, ny) phase:phase] ? 1 : 0) : 0;
+}
+
+// Present the native iOS settings panel (ios_settings_ui.m) over the game. Reached from the
+// engine menu's "iOS settings" entry and the touch chrome gear button (both run `ios_settings`).
+extern UIViewController *Q2_iOS_NewSettingsVC(void);
+void Q2_iOS_PresentSettings(void) {
+    UIViewController *root = g_touchView.window.rootViewController;
+    if (!root || root.presentedViewController) return;   // no window yet, or something already modal
+    [root presentViewController:Q2_iOS_NewSettingsVC() animated:YES completion:nil];
+}
 
 // ---- Soft-keyboard key catcher ----------------------------------------------
 // An invisible first-responder that forwards iOS keystrokes straight into the engine
@@ -638,6 +1105,7 @@ static int cmp_double(const void *x, const void *y) {   // ascending, for percen
     gl.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     gl.multipleTouchEnabled = YES;
     vc.view = gl;
+    g_touchView = gl;   // console seams (touchedit / q2_faketouch) reach the editor through this
 #if TARGET_OS_VISION
     // Claim the gamepad from the system. visionOS by default converts controller
     // presses into gaze-pinch UI events (A = tap where you look) and withholds
@@ -694,9 +1162,12 @@ static int cmp_double(const void *x, const void *y) {   // ascending, for percen
 // the app ships a newer menu, so a user's tweaks persist within a version.
 // Install a bundled menu resource into <docs>/<gamedir>/q2repro.menu. Version-marked
 // first line: overwrite only when the app ships a newer menu (user tweaks persist).
-- (void)installMenuResource:(NSString *)resource intoGame:(NSString *)gamedir {
-    NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
-    NSString *dir = [docs stringByAppendingPathComponent:gamedir];
+// Write into <homedir>/<gamedir> — the writable dir the engine's FS actually searches (homedir
+// is searched before basedir). Writing to Documents/<gamedir> was the bug: on a rerelease install
+// homedir is Documents/profile, so Documents/baseq2 is NOT on the search path and the custom menu
+// (iOS Settings, mods, Action theming) silently never loaded → "No such menu: ios".
+- (void)installMenuResource:(NSString *)resource intoGame:(NSString *)gamedir homedir:(NSString *)home {
+    NSString *dir = [home stringByAppendingPathComponent:gamedir];
     NSString *src = [NSBundle.mainBundle pathForResource:resource ofType:@"menu"];
     if (!src) { NSLog(@"[q2repro] bundled %@.menu missing", resource); return; }
     [NSFileManager.defaultManager createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
@@ -707,12 +1178,12 @@ static int cmp_double(const void *x, const void *y) {   // ascending, for percen
     NSString *ev = [existing componentsSeparatedByString:@"\n"].firstObject;
     if (!existing || ![ev isEqualToString:bv]) {
         [bundled writeToFile:dst atomically:YES encoding:NSUTF8StringEncoding error:nil];
-        NSLog(@"[q2repro] installed %@/q2repro.menu (%@)", gamedir, bv);
+        NSLog(@"[q2repro] installed %@/q2repro.menu into homedir (%@)", gamedir, bv);
     }
 }
-- (void)installMenu {
-    [self installMenuResource:@"q2repro" intoGame:@"baseq2"];   // base menu
-    [self installMenuResource:@"action"  intoGame:@"action"];   // Action Quake theming (ships in IPA)
+- (void)installMenuInto:(NSString *)home {
+    [self installMenuResource:@"q2repro" intoGame:@"baseq2" homedir:home];   // base menu
+    [self installMenuResource:@"action"  intoGame:@"action" homedir:home];   // Action Quake theming (ships in IPA)
 }
 
 // ---- First-run game-data import (UIDocumentPicker) --------------------------
@@ -941,7 +1412,7 @@ static NSString *DocsDir(void) {
 // Build baseq2/q2repro_mods.menu listing installed mods/packs (folders with paks),
 // filtered by a curated allowlist (baseq2/mods.lst) when present — so junk paks
 // auto-downloaded from servers never clutter the list. Tapping a mod switches to it.
-- (void)generateModsMenu {
+- (void)generateModsMenuInto:(NSString *)home {
     NSFileManager *fm = NSFileManager.defaultManager; NSString *docs = DocsDir();
     NSString *lst = [NSString stringWithContentsOfFile:[docs stringByAppendingPathComponent:@"baseq2/mods.lst"]
                                               encoding:NSUTF8StringEncoding error:nil];
@@ -985,15 +1456,14 @@ static NSString *DocsDir(void) {
         else    [m appendFormat:@"    action \"%@\" \"game_apply %@; pushmenu main\"\n", mod, mod];  // classic mod
     }
     [m appendString:@"end\n"];
-    [m writeToFile:[docs stringByAppendingPathComponent:@"baseq2/q2repro_mods.menu"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    // Written into homedir/baseq2 (searched, and next to the q2repro.menu that includes it).
+    [m writeToFile:[home stringByAppendingPathComponent:@"baseq2/q2repro_mods.menu"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
     NSLog(@"[q2repro] mods menu: %lu mod(s)%@", (unsigned long)mods.count, allow ? @" (allowlist)" : @"");
 }
 
 - (void)startEngine {
     if (self.engineStarted) return;
     self.engineStarted = YES;
-    [self installMenu];
-    [self generateModsMenu];
 
     NSString *docs = DocsDir();
     const char *cdocs = docs.fileSystemRepresentation; (void)cdocs;
@@ -1011,6 +1481,13 @@ static NSString *DocsDir(void) {
     // the old in-baseq2 settings across once so nothing is lost.
     NSString *home = vanilla ? base : [self profileDir];
     if (!vanilla) [self migrateSettingsInto:home];
+
+    // Install the bundled menus + generate the mods list INTO homedir (must precede engine boot;
+    // the UI parses them at init). This has to run AFTER `home` is known — writing them to the
+    // wrong dir is what broke the iOS Settings menu on rerelease installs.
+    [self installMenuInto:home];
+    [self generateModsMenuInto:home];
+
     const char *cbase = base.fileSystemRepresentation;
     const char *chome = home.fileSystemRepresentation;
     static char *argv[48]; int argc = 0;
@@ -1345,6 +1822,7 @@ UIViewController *Q2_MakeGameViewController(void) {
     gl.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     gl.multipleTouchEnabled = YES;
     vc.view = gl;
+    g_touchView = gl;   // console seams (touchedit / q2_faketouch) reach the editor through this
     if (@available(visionOS 2.0, *)) {   // claim the pad from gaze-pinch (see bringUpGameInWindow)
         GCEventInteraction *padIntent = [[GCEventInteraction alloc] init];
         padIntent.handledEventTypes = GCUIEventTypeGamepad;

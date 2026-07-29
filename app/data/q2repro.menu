@@ -1,4 +1,4 @@
-// Q2REPRO_IOS_MENU_V10
+// Q2REPRO_IOS_MENU_V13
 /*
 This is example menu definition file for Q2PRO.
 
@@ -70,22 +70,9 @@ color selection #0f90eb64
 color disabled #7f7f7f
 
 
-begin ios
-    title "iOS Settings"
-    pairs "refresh rate" ios_display_fps "native max" 0 "60 hz" 60
-    range "horiz sensitivity" ios_sens_x 1 6
-    range "vert sensitivity" ios_sens_y 1 6
-    toggle "invert look" ios_invert_y
-    range "gyro aim" ios_gyro 0 3
-    range "menu size" ui_scale 3 7
-    range "touch size" ios_touch_scale 0.7 1.4
-    range "touch opacity" ios_touch_alpha 0.4 1.5
-    toggle "lefty touch layout" ios_touch_lefty
-    toggle "fire haptics" ios_haptics
-    toggle "fps counter" ios_fps
-    toggle "per-pixel dlights (slow)" gl_per_pixel_lighting
-    toggle "always run" cl_run
-end
+// iOS settings live in a NATIVE UIKit panel (ios_settings_ui.m), opened by the GEAR BUTTON in
+// the touch chrome (shown whenever a menu is up). There is deliberately no "iOS settings" entry
+// in this engine menu — it was only a shortcut to the same panel, so it was removed.
 
 begin video
     //title "Video Setup"
@@ -140,7 +127,7 @@ end
 begin options
     //title "Options"
     banner m_banner_options
-    action "iOS settings" pushmenu ios
+    action "iOS settings" ios_settings
     action "mods & packs" pushmenu mods
     action "player setup" pushmenu players
     action "input setup" pushmenu input
@@ -376,7 +363,7 @@ begin game
     action "browse address book" pushmenu servers "favorites://" "file:///servers.lst" "broadcast://"
     action "browse demos" pushmenu demos
     action "single player" pushmenu singleplayer
-    action "iOS settings" pushmenu ios
+    action "iOS settings" ios_settings
     action "mods & packs" pushmenu mods
     action "options" pushmenu options
     action "disconnect" disconnect

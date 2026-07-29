@@ -12,7 +12,7 @@ settings:
     TARGETED_DEVICE_FAMILY: "1"
     ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon   # app icon (Assets.xcassets)
     STRIP_INSTALLED_PRODUCT: NO   # archives strip exported symbols → dlsym-class silent crashes
-    MARKETING_VERSION: "1.0.8"
+    MARKETING_VERSION: "1.0.9"
     CURRENT_PROJECT_VERSION: "1"
     GCC_C_LANGUAGE_STANDARD: gnu11
     GCC_WARN_ABOUT_DEPRECATED_FUNCTIONS: NO
@@ -23,6 +23,10 @@ settings:
       - USE_REF=1
       - _GNU_SOURCE=1
       - Q2_USE_ANGLE=1
+      # OTA-only dev builds (4-component version, e.g. 1.0.8.2) get Q2_DEV_BUILD=1, which enables
+      # dev-only features (the remote console). Public releases are 3-component (1.0.9) → 0, so
+      # those features COMPILE OUT entirely. Derived from the version below — no manual flag (§6).
+      - Q2_DEV_BUILD=0
       # angle-bracket form avoids quote-escaping; resolves via -Iinc. Do NOT add
       # inc/common to the header path — it shadows the system <math.h>.
       - Q2PROTO_CONFIG_H=<common/q2proto_config.h>
