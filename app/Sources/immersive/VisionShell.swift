@@ -17,7 +17,7 @@ import UIKit
 enum XR3 {
     static let d = UserDefaults.standard
     static func f(_ k: String, _ def: Float) -> Float { d.object(forKey: k) == nil ? def : d.float(forKey: k) }
-    // Defaults per SETTINGS-SPEC-FROM-VKQUAKE.md (Austin's dialed-in vkQuake values).
+    // Defaults per SETTINGS-SPEC-FROM-VKQUAKE.md (the dialed-in vkQuake values).
     static var distance: Float  { f("xr_dist", 3.6) }      // metres in front
     static var halfWidth: Float { f("xr_halfW", 2.75) }    // metres (full width 5.5)
     static var halfHeight: Float { f("xr_halfH", 1.55) }   // metres (full height 3.1) — free shape
@@ -168,7 +168,7 @@ struct Q2VisionApp: App {
                 }
             }
                 .ornament(attachmentAnchor: .scene(.bottom), contentAlignment: .top) {
-                    // Austin's final layout (spec update): bottom pill hanging fully BELOW
+                    // Final layout (spec update): bottom pill hanging fully BELOW
                     // the window (contentAlignment .top pins the pill's top to the edge).
                     HStack(spacing: 16) {
                         Button(model.immersive ? "Exit 3D" : "3D") {
