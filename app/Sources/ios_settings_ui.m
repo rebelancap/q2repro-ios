@@ -212,16 +212,29 @@ static void SetCvar(NSString *cvar, float v) {
 }
 
 - (void)done { [self dismissViewControllerAnimated:YES completion:nil]; }
-#if !TARGET_OS_VISION
+// Landscape on BOTH platforms: the app's Info.plist is landscape-only, and on visionOS the
+// autorotation machinery still runs on our modal (below), so the reported orientation must
+// intersect the app's or UIKit aborts.
 - (UIInterfaceOrientationMask)supportedInterfaceOrientations { return UIInterfaceOrientationMaskLandscape; }
-#endif
+@end
+
+// The nav controller that wraps the panel. visionOS presents a modal as an ornament-platter
+// sheet and runs the iOS autorotation machinery on THIS wrapping controller — and a plain
+// UINavigationController does NOT forward supportedInterfaceOrientations to its top view
+// controller, so Q2SettingsVC's override never reached it. A bare present therefore aborted
+// with UIApplicationInvalidInterfaceOrientation ("no common orientation with the application")
+// because the app is landscape-only. Report landscape here so the intersection is never empty.
+@interface Q2SettingsNav : UINavigationController
+@end
+@implementation Q2SettingsNav
+- (UIInterfaceOrientationMask)supportedInterfaceOrientations { return UIInterfaceOrientationMaskLandscape; }
 @end
 
 // Factory used by main.m's Q2_iOS_PresentSettings — returns a nav-wrapped panel, dark-styled.
 UIViewController *Q2_iOS_NewSettingsVC(void) {
     Q2SettingsVC *vc = [Q2SettingsVC new];
-    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
+    Q2SettingsNav *nav = [[Q2SettingsNav alloc] initWithRootViewController:vc];
     nav.overrideUserInterfaceStyle = UIUserInterfaceStyleDark;
-    nav.modalPresentationStyle = UIModalPresentationFullScreen;
+    nav.modalPresentationStyle = UIModalPresentationFullScreen;   // iOS covers the game; visionOS coerces to a sheet
     return nav;
 }
