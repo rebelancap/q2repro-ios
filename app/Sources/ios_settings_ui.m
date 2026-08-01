@@ -12,6 +12,7 @@
 // the `ios_settings` console command (ios_bridge.m).
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
+#import "ios_audio.h"
 
 extern void  VID_iOS_Command(const char *cmd);
 extern float VID_iOS_CvarValue(const char *name);
@@ -81,8 +82,44 @@ static void SetCvar(NSString *cvar, float v) {
 }
 @end
 
+// ---- one-of-N picker (pushed from a "choice" row) ---------------------------
+// Each option carries a sentence saying what it actually does. That is the whole
+// point of the Audio section: "duck" and "mix" mean nothing to a player, and a
+// four-word label would not help either.
+@interface Q2ChoiceVC : UITableViewController
+@property(nonatomic, copy) NSArray<NSString *> *titles, *details;
+@property(nonatomic, copy) NSString *cvar;
+@property(nonatomic, copy) void (^onPick)(void);
+@end
+@implementation Q2ChoiceVC
+- (instancetype)init { return [super initWithStyle:UITableViewStyleInsetGrouped]; }
+- (NSInteger)tableView:(UITableView *)t numberOfRowsInSection:(NSInteger)s { return _titles.count; }
+- (UITableViewCell *)tableView:(UITableView *)t cellForRowAtIndexPath:(NSIndexPath *)ip {
+    UITableViewCell *c = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:nil];
+    c.textLabel.text = _titles[ip.row];
+    c.detailTextLabel.text = _details[ip.row];
+    c.detailTextLabel.textColor = UIColor.secondaryLabelColor;
+    c.detailTextLabel.numberOfLines = 0;   // let the explanation wrap rather than truncate
+    int cur = (int)lroundf(VID_iOS_CvarValue(_cvar.UTF8String));
+    c.accessoryType = (ip.row == cur) ? UITableViewCellAccessoryCheckmark : UITableViewCellAccessoryNone;
+    return c;
+}
+- (void)tableView:(UITableView *)t didSelectRowAtIndexPath:(NSIndexPath *)ip {
+    [t deselectRowAtIndexPath:ip animated:YES];
+    SetCvar(_cvar, (float)ip.row);
+    [t reloadData];
+    if (_onPick) _onPick();
+    // Let the checkmark land before backing out, so the choice is visibly taken.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [self.navigationController popViewControllerAnimated:YES];
+    });
+}
+- (UIInterfaceOrientationMask)supportedInterfaceOrientations { return UIInterfaceOrientationMaskLandscape; }
+@end
+
 // ---- the panel --------------------------------------------------------------
 @interface Q2SettingsVC : UITableViewController
+- (NSDictionary *)rowAt:(NSIndexPath *)ip;   // exposed for the console test seam below
 @end
 @implementation Q2SettingsVC {
     NSArray<NSDictionary *> *_sections;   // each: {title, rows:[rowDict...]}
@@ -115,6 +152,15 @@ static void SetCvar(NSString *cvar, float v) {
           @{ @"kind": @"slider", @"title": @"Control Opacity",        @"cvar": @"ios_touch_alpha", @"min": @(0.4), @"max": @(1.5), @"fmt": pct },
           @{ @"kind": @"toggle", @"title": @"Fire Haptics",           @"cvar": @"ios_haptics" },
       ]},
+      // Master gain on top of the engine's own Sound/Music Volume cvars, so this
+      // never overwrites what the in-game Options menu is set to — and, critically,
+      // the ducking applied by the modes below is never written back to config.cfg
+      // (that ratchets the player's real volume down over days). See ios_audio.m.
+      @{ @"title": @"Audio", @"rows": @[
+          @{ @"kind": @"slider", @"title": @"Game Volume", @"cvar": @"ios_volume", @"min": @0, @"max": @1, @"fmt": pct },
+          @{ @"kind": @"choice", @"title": @"Other App Audio", @"cvar": @"ios_audio_mode",
+             @"titles": Q2_iOS_AudioModeTitles(), @"details": Q2_iOS_AudioModeDetails() },
+      ]},
       @{ @"title": @"Display", @"rows": @[
           // Brightness = the engine `intensity` texture multiplier. In the GLSL backend (this build)
           // it is NOT a CVAR_FILES cvar, so it applies live — unlike vid_gamma, which is baked into
@@ -136,6 +182,9 @@ static void SetCvar(NSString *cvar, float v) {
 #endif
     _sections = sections;
 }
+
+// Popping back from a picker: refresh so the choice row's summary shows the new pick.
+- (void)viewWillAppear:(BOOL)animated { [super viewWillAppear:animated]; [self.tableView reloadData]; }
 
 - (NSDictionary *)rowAt:(NSIndexPath *)ip { return _sections[ip.section][@"rows"][ip.row]; }
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)t { return _sections.count; }
@@ -165,6 +214,15 @@ static void SetCvar(NSString *cvar, float v) {
         NSUInteger sel = 0;
         for (NSUInteger i = 0; i < c.values.count; i++) if (fabsf([c.values[i] floatValue] - cur) < 0.5f) sel = i;
         c.seg.selectedSegmentIndex = sel;
+        return c;
+    }
+    if ([kind isEqualToString:@"choice"]) {   // taps through to the one-of-N picker
+        UITableViewCell *c = [t dequeueReusableCellWithIdentifier:@"ch"] ?: [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:@"ch"];
+        c.textLabel.text = r[@"title"];
+        NSArray *titles = r[@"titles"];
+        int cur = (int)lroundf(VID_iOS_CvarValue([r[@"cvar"] UTF8String]));
+        c.detailTextLabel.text = (cur >= 0 && cur < (int)titles.count) ? titles[cur] : @"";
+        c.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
         return c;
     }
     if ([kind isEqualToString:@"toggle"]) {
@@ -204,6 +262,17 @@ static void SetCvar(NSString *cvar, float v) {
 - (void)tableView:(UITableView *)t didSelectRowAtIndexPath:(NSIndexPath *)ip {
     [t deselectRowAtIndexPath:ip animated:YES];
     NSDictionary *r = [self rowAt:ip];
+    if ([r[@"kind"] isEqualToString:@"choice"]) {
+        Q2ChoiceVC *vc = [Q2ChoiceVC new];
+        vc.title = r[@"title"];
+        vc.titles = r[@"titles"]; vc.details = r[@"details"]; vc.cvar = r[@"cvar"];
+        // "Stop Other Audio" has to re-activate the session to interrupt the other
+        // app, so the choice must reach the policy layer the moment it is made —
+        // not at the next 4 Hz poll, which only re-asserts the category.
+        vc.onPick = ^{ Q2_iOS_AudioApply(); };
+        [self.navigationController pushViewController:vc animated:YES];
+        return;
+    }
     NSString *cmd = r[@"cmd"];
     if (cmd) {
         // Dismiss first so a command like `touchedit` shows its result over the game, not us.
@@ -230,9 +299,38 @@ static void SetCvar(NSString *cvar, float v) {
 - (UIInterfaceOrientationMask)supportedInterfaceOrientations { return UIInterfaceOrientationMaskLandscape; }
 @end
 
+// Weak ref to the live panel, for the console test seam below.
+static __weak Q2SettingsVC *g_settingsVC;
+
+// q2_settings_probe <row title substring> [select] — headless "scroll to / tap this
+// settings row". Synthetic UIKit touches never reach the simulator's real touch path
+// (the same reason q2_faketouch exists for the layout editor), and driving the Mac's UI
+// with System Events needs Accessibility permission a headless session does not have.
+// So this scrolls the row into view and, with `select`, calls the SAME delegate method a
+// finger does — which is what makes the Audio section and its picker screenshot-able.
+void Q2_iOS_SettingsProbe(const char *want, int select) {
+    Q2SettingsVC *vc = g_settingsVC;
+    if (!vc || !want || !*want) { NSLog(@"[q2repro] settings probe: no panel open"); return; }
+    NSString *needle = @(want);
+    for (NSInteger s = 0; s < [vc numberOfSectionsInTableView:vc.tableView]; s++) {
+        for (NSInteger r = 0; r < [vc tableView:vc.tableView numberOfRowsInSection:s]; r++) {
+            NSIndexPath *ip = [NSIndexPath indexPathForRow:r inSection:s];
+            NSString *title = [vc rowAt:ip][@"title"];
+            if ([title rangeOfString:needle options:NSCaseInsensitiveSearch].location == NSNotFound) continue;
+            NSLog(@"[q2repro] settings probe: %s '%@' (%ld,%ld)", select ? "selecting" : "scrolling to",
+                  title, (long)s, (long)r);
+            [vc.tableView scrollToRowAtIndexPath:ip atScrollPosition:UITableViewScrollPositionMiddle animated:NO];
+            if (select) [vc tableView:vc.tableView didSelectRowAtIndexPath:ip];
+            return;
+        }
+    }
+    NSLog(@"[q2repro] settings probe: no row matching '%@'", needle);
+}
+
 // Factory used by main.m's Q2_iOS_PresentSettings — returns a nav-wrapped panel, dark-styled.
 UIViewController *Q2_iOS_NewSettingsVC(void) {
     Q2SettingsVC *vc = [Q2SettingsVC new];
+    g_settingsVC = vc;
     Q2SettingsNav *nav = [[Q2SettingsNav alloc] initWithRootViewController:vc];
     nav.overrideUserInterfaceStyle = UIUserInterfaceStyleDark;
     nav.modalPresentationStyle = UIModalPresentationFullScreen;   // iOS covers the game; visionOS coerces to a sheet

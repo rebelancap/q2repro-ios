@@ -18,6 +18,21 @@ extern void Key_Event(unsigned key, bool down, unsigned time);  // keys.c (priva
 static cvar_t *c_sens_x, *c_sens_y, *c_invert_y, *c_touch_scale, *c_touch_alpha,
               *c_touch_lefty, *c_haptics, *c_display_fps, *c_fps, *c_gyro;
 
+// Audio settings (ios_audio.m). Registered LAZILY, not in VID_iOS_RegisterCvars:
+// the CoreAudio driver reads the mode from inside S_Init — i.e. during
+// Qcommon_Init, before RegisterCvars runs — because the session category has to
+// be right before the driver's first setActive:YES (that is the only activation
+// that can interrupt another app's audio). Cvar_Get here adopts whatever
+// config.cfg already exec'd, so a saved choice still wins.
+static cvar_t *c_audio_mode, *c_volume;
+static void EnsureAudioCvars(void)
+{
+    if (!c_audio_mode) c_audio_mode = Cvar_Get("ios_audio_mode", "2", CVAR_ARCHIVE);  // 2 = Lower Other Audio
+    if (!c_volume)     c_volume     = Cvar_Get("ios_volume",     "1", CVAR_ARCHIVE);
+}
+int   VID_iOS_AudioMode(void) { EnsureAudioCvars(); return c_audio_mode->integer; }
+float VID_iOS_Volume(void)    { EnsureAudioCvars(); return c_volume->value; }
+
 // 'game_apply <dir>' — switch game modules safely. Order matters: tearing the
 // session down FIRST means the (latched) game cvar applies instantly and its
 // filesystem restart happens with nothing playing. Switching a live session's
@@ -69,6 +84,16 @@ static void Rcon_f(void)
 // and a gear button in the touch chrome does too — decoupled from the fragile .menu system.
 static void IOSSettings_f(void) { Q2_iOS_PresentSettings(); }
 
+// q2_settings_probe <row title substring> [select] — headless scroll-to/tap of a settings
+// row, so the panel below the fold can be screenshot on the simulator (see
+// ios_settings_ui.m; same rationale as q2_faketouch).
+extern void Q2_iOS_SettingsProbe(const char *want, int select);
+static void SettingsProbe_f(void)
+{
+    if (Cmd_Argc() < 2) { Com_Printf("usage: q2_settings_probe <row title substring> [select]\n"); return; }
+    Q2_iOS_SettingsProbe(Cmd_Argv(1), Cmd_Argc() > 2 && !Q_stricmp(Cmd_Argv(2), "select"));
+}
+
 // touchedit [reset|print] — toggle the on-screen layout editor; `reset` restores shipped
 // positions; `print` dumps the live layout in the exact form the defaults table takes, so a
 // layout arranged on the device can be promoted to source defaults without transcribing.
@@ -102,6 +127,7 @@ void VID_iOS_RegisterCvars(void)
     Cmd_AddCommand("touchedit", TouchEdit_f);       // customizable touch layout editor
     Cmd_AddCommand("q2_faketouch", FakeTouch_f);     // headless editor test seam
     Cmd_AddCommand("ios_settings", IOSSettings_f);   // native iOS settings panel
+    Cmd_AddCommand("q2_settings_probe", SettingsProbe_f);   // headless settings-row test seam
     Cmd_AddCommand("q2_rcon", Rcon_f);               // remote console on/off (dev builds)
     c_sens_x      = Cvar_Get("ios_sens_x",     "3",   CVAR_ARCHIVE);
     c_sens_y      = Cvar_Get("ios_sens_y",     "3",   CVAR_ARCHIVE);
@@ -113,6 +139,7 @@ void VID_iOS_RegisterCvars(void)
     c_display_fps = Cvar_Get("ios_display_fps","0",   CVAR_ARCHIVE);
     c_fps         = Cvar_Get("ios_fps",        "0",   CVAR_ARCHIVE);
     c_gyro        = Cvar_Get("ios_gyro",       "0",   CVAR_ARCHIVE);
+    EnsureAudioCvars();   // no-op if S_Init already forced them into existence
 }
 
 // Generic cvar read for the native iOS settings panel (it writes via VID_iOS_Command "set ...").

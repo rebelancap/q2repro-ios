@@ -18,10 +18,23 @@ int  Q2_iOS_RemoteConsoleRunning(void);
 #import <sys/socket.h>
 #import <netinet/in.h>
 #import <unistd.h>
+#import <errno.h>
+#import <stdlib.h>
 
 extern void VID_iOS_Command(const char *cmd);
 
 #define Q2_RCON_PORT 8770   // outside the HarbourMasters-reserved 8765–8769 range
+
+// A SIMULATOR app shares the Mac's network stack, so 8770 can already be taken by
+// something on this machine — the bind then fails silently and the console looks alive
+// but answers nothing. Q2_RCON_PORT in the environment (SIMCTL_CHILD_Q2_RCON_PORT)
+// moves it. Devices have their own stack and never need this.
+static int q2_rcon_port(void)
+{
+    const char *e = getenv("Q2_RCON_PORT");
+    int p = e ? atoi(e) : 0;
+    return (p > 0 && p < 65536) ? p : Q2_RCON_PORT;
+}
 
 @interface Q2RemoteConsole : NSObject
 @property(nonatomic) BOOL running;
@@ -48,7 +61,7 @@ extern void VID_iOS_Command(const char *cmd);
     if (_running) return;
     _running = YES;
     dispatch_async(_q, ^{ [self serve]; });
-    NSLog(@"[q2repro] remote console: listening on tcp/%d (tailnet)", Q2_RCON_PORT);
+    NSLog(@"[q2repro] remote console: starting on tcp/%d (tailnet)", q2_rcon_port());
 }
 - (void)stop {
     _running = NO;
@@ -60,8 +73,14 @@ extern void VID_iOS_Command(const char *cmd);
     if (fd < 0) { _running = NO; return; }
     int yes = 1; setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
     struct sockaddr_in addr; memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET; addr.sin_addr.s_addr = INADDR_ANY; addr.sin_port = htons(Q2_RCON_PORT);
-    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0 || listen(fd, 1) < 0) { close(fd); _running = NO; return; }
+    addr.sin_family = AF_INET; addr.sin_addr.s_addr = INADDR_ANY; addr.sin_port = htons(q2_rcon_port());
+    // Loud, not silent: a failed bind used to leave "listening" in the log with nothing
+    // actually accepting — the port was already taken by another process on the host.
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0 || listen(fd, 1) < 0) {
+        NSLog(@"[q2repro] remote console: bind/listen on tcp/%d FAILED (%s)", q2_rcon_port(), strerror(errno));
+        close(fd); _running = NO; return;
+    }
+    NSLog(@"[q2repro] remote console: listening on tcp/%d", q2_rcon_port());
     _listenfd = fd;
     while (_running) {
         int c = accept(fd, NULL, NULL);

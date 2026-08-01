@@ -40,6 +40,9 @@ extern void VID_iOS_MenuKey(int which, bool down);
 extern void VID_iOS_ToggleMenu(void);
 enum { IOS_MENU_CLICK = 0, IOS_MENU_UP, IOS_MENU_DOWN, IOS_MENU_LEFT,
        IOS_MENU_RIGHT, IOS_MENU_ENTER, IOS_MENU_BACK };
+// Audio session policy + master mix gain — ios_audio.m.
+extern void  Q2_iOS_AudioBoot(void);
+extern void  Q2_iOS_AudioTick(void);
 // iOS settings cvars — ios_bridge.m.
 extern void  VID_iOS_RegisterCvars(void);
 extern float VID_iOS_SensX(void);
@@ -122,6 +125,15 @@ static NSString * const Q2LayoutSetKey = @"q2.layoutSet";
 // "stick"), invisible in play (the stick floats to wherever the thumb lands) and
 // drawn at its true radius in the editor so what you drag is exactly what responds.
 static const CGFloat STICK_ZONE_DIAMETER = 300;
+
+// In-game touch-control glyph metrics. Both are fractions of the button's LIVE
+// diameter (base size × ios_touch_scale), so a glyph — and a text label on the
+// handful of buttons that have no symbol — tracks the layout editor's size slider
+// instead of sitting at a fixed point size inside a resized circle.
+// 0.396 = the previous 0.44, 10% smaller (2026-07-31, matches vkQuake's density).
+#define Q2_GLYPH_RATIO  0.396f
+#define Q2_LABEL_RATIO  0.28f     // text buttons (WPN / OK / Z+ and symbol fallbacks)
+#define Q2_GLYPH_WEIGHT UIImageSymbolWeightRegular
 
 // Weak ref to the live touch view so the console seams (touchedit / q2_faketouch,
 // registered engine-side in ios_bridge.m) reach the editor without a singleton.
@@ -708,6 +720,19 @@ static __weak GLView *g_touchView;
     UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:sz*ratio weight:w];
     [b setPreferredSymbolConfiguration:cfg forImageInState:UIControlStateNormal];
 }
+// A gameplay button's contents (SF Symbol OR text label) sized from its LIVE diameter,
+// so both follow the layout editor's size slider. Re-rendering the symbol at the new
+// point size — rather than stretching a fixed-size image — keeps it vector-crisp at
+// every scale; the cached "glyphsz" keeps that off the per-frame path (updateTouchUI runs
+// every display-link tick, and only the slider ever changes this).
+- (void)sizePadContents:(NSMutableDictionary *)d to:(CGFloat)sz {
+    if (fabs([d[@"glyphsz"] doubleValue] - sz) < 0.01) return;
+    d[@"glyphsz"] = @(sz);
+    UIButton *b = d[@"b"];
+    [self sizeSymbol:b to:sz ratio:Q2_GLYPH_RATIO weight:Q2_GLYPH_WEIGHT];
+    if (b.currentTitle.length)
+        b.titleLabel.font = [UIFont boldSystemFontOfSize:sz * Q2_LABEL_RATIO];
+}
 - (void)padDown:(UIButton *)b {
     VID_iOS_KeyEvent((int)b.tag, YES);
     if (b.tag == K_RIGHT_TRIGGER && VID_iOS_Haptics()) Q2_HAPTIC(_haptic);
@@ -806,19 +831,21 @@ static __weak GLView *g_touchView;
     BOOL hideGame = (inMenu || passive || pad) && !editing;   // controls only during live touch play (editor overrides)
     if (pad) VID_iOS_SetWheelAnchor(-1, -1);            // controller → wheel renders at default centre
     BOOL layoutUp = VID_iOS_LayoutActive();             // Action join/loadout menu on screen
-    // Context button: thin weapon-wheel glyph in Quake II, "WPN" text in Action. Only reskin
-    // on a game change (avoids per-frame churn).
+    // Context button: weapon-wheel glyph in Quake II, "WPN" text in Action. Only reskin
+    // on a game change (avoids per-frame churn). The wheel uses the FILLED hexagon grid —
+    // the hollow variant read as a cluster of empty rings and did not match vkQuake's.
     int isAct = VID_iOS_IsAction() ? 1 : 0;
     if (isAct != _wheelIsAction) {
         _wheelIsAction = isAct;
         if (isAct) {
             [_wheelBtn setImage:nil forState:UIControlStateNormal];
             [_wheelBtn setTitle:@"WPN" forState:UIControlStateNormal];
-            _wheelBtn.titleLabel.font = [UIFont boldSystemFontOfSize:15];
         } else {
             [_wheelBtn setTitle:nil forState:UIControlStateNormal];
-            [_wheelBtn setImage:[UIImage systemImageNamed:@"circle.hexagongrid"] forState:UIControlStateNormal];
+            [_wheelBtn setImage:[UIImage systemImageNamed:@"circle.hexagongrid.fill"] forState:UIControlStateNormal];
         }
+        for (NSMutableDictionary *d in _btns)      // force a re-size of the swapped contents
+            if (d[@"b"] == _wheelBtn) d[@"glyphsz"] = @(0);
     }
     for (NSMutableDictionary *d in _btns) {
         if ([d[@"zone"] boolValue]) continue;           // the move zone has no UIButton (drawn below)
@@ -831,8 +858,7 @@ static __weak GLView *g_touchView;
                                    r.origin.y + [d[@"uy"] doubleValue] * r.size.height);
             b.layer.cornerRadius = sz / 2;
         }
-        UIImageSymbolWeight w = (b == _wheelBtn) ? UIImageSymbolWeightLight : UIImageSymbolWeightRegular;  // lighter glyphs
-        [self sizeSymbol:b to:sz ratio:0.44 weight:w];   // a touch smaller + lighter than before
+        [self sizePadContents:d to:sz];   // glyph AND text label track ios_touch_scale
         b.alpha = editing ? 0.95 : alpha * 0.85;
         b.hidden = ![self controlShownInContext:d isAction:isAct layoutUp:layoutUp] || (hideGame && !editing);
     }
@@ -1517,6 +1543,8 @@ static NSString *DocsDir(void) {
     NSLog(@"[q2repro] Qcommon_Init basedir=%s home=%s rerelease=%d", cbase, chome, hasRR);
     Qcommon_Init(argc, argv);
     VID_iOS_RegisterCvars();   // ios_* settings cvars (CVAR_ARCHIVE)
+    Q2_iOS_AudioBoot();        // route-change/interruption observers (the category itself
+                               // was already set from S_Init — see snddma_coreaudio.m)
     // Default pad layout for vanilla-pak installs (config.cfg already exec'd, so user
     // rebinds win). Needed at boot — not just pad-connect — because the TOUCH weapon
     // wheel resolves through the right_shoulder bind too.
@@ -1681,6 +1709,9 @@ static NSString *DocsDir(void) {
 
 - (void)tick {
     double t0 = self.benchmark ? CACurrentMediaTime() : 0;
+    // Before anything that can early-out: the intro cinematic and the attract demo
+    // make sound long before there is a live game to gate on.
+    Q2_iOS_AudioTick();
     [self pollController];
     double f0 = self.benchmark ? CACurrentMediaTime() : 0;
 #if defined(Q2_XR_UI) && Q2_XR_UI

@@ -1,0 +1,40 @@
+--- a/src/client/sound/dma.c	2026-07-31 21:52:25
++++ b/src/client/sound/dma.c	2026-07-31 21:52:37
+@@ -36,6 +36,22 @@
+ static cvar_t       *s_mixahead;
+ 
+ static float    snd_vol;
++
++// iOS/visionOS master mix gain, driven by app/Sources/ios_audio.m ("Game Volume"
++// plus the "Lower/Mute Game Audio" other-app modes). Deliberately NOT a cvar:
++// volume/s_volume are CVAR_ARCHIVE, so a ducked value would be written to
++// config.cfg on resign-active and become the base volume at next launch — a
++// ratchet that walks the player's real volume down over days. It also has to sit
++// ON TOP of the engine cvars so the in-game Options sliders keep working.
++// Applied in TransferPaintBuffer, i.e. after the raw stream is mixed in, so one
++// multiply covers sound effects, ogg music and cinematic audio alike. Inert
++// (1.0) on every other platform.
++float           s_ext_gain = 1.0f;
++
++void S_SetExternalGain(float g)
++{
++    s_ext_gain = Q_clipf(g, 0.0f, 1.0f);
++}
+ 
+ static int          s_rawend;
+ static samplepair_t s_rawsamples[MAX_RAW_SAMPLES];
+@@ -258,6 +274,14 @@
+         }
+     }
+ 
++    // External (platform shell) master gain — see s_ext_gain above.
++    if (s_ext_gain != 1.0f) {
++        for (i = 0; i < endtime - s_paintedtime; i++) {
++            samp[i].left  *= s_ext_gain;
++            samp[i].right *= s_ext_gain;
++        }
++    }
++
+     if (dma.samplebits == 16 && dma.channels == 2) {
+         // optimized case
+         TransferStereo16(samp, endtime);

@@ -14,6 +14,8 @@
 #include "common/zone.h"
 #include "client/sound/dma.h"
 
+extern void Q2_iOS_AudioApply(void);   // session category/options policy (ios_audio.m)
+
 static AudioUnit s_au;
 static pthread_mutex_t s_lock = PTHREAD_MUTEX_INITIALIZER;
 static bool s_running;
@@ -66,9 +68,13 @@ static sndinitstat_t ca_init(void)
 
     // Audio session: Playback = game sound plays through the silent switch (game
     // convention; also makes a device sound-test valid regardless of the mute switch).
+    // The MIXABILITY options come from the player's "Other App Audio" setting, and
+    // they must be in place BEFORE the setActive:YES below: that first activation is
+    // the only moment a non-mixable session can interrupt Music/a podcast, and
+    // setActive:YES on an already-active session is a no-op. See ios_audio.m.
     NSError *err = nil;
     AVAudioSession *sess = [AVAudioSession sharedInstance];
-    [sess setCategory:AVAudioSessionCategoryPlayback error:&err];
+    Q2_iOS_AudioApply();
     [sess setActive:YES error:&err];
     if (err) Com_WPrintf("CoreAudio: session warning: %s\n", err.localizedDescription.UTF8String);
 
@@ -124,7 +130,9 @@ static void ca_submit(void)         { pthread_mutex_unlock(&s_lock); }
 static void ca_activate(bool active)
 {
     if (!s_au) return;
-    if (active && !s_running)      { [[AVAudioSession sharedInstance] setActive:YES error:nil]; AudioOutputUnitStart(s_au); s_running = true; }
+    // Returning to the foreground: re-assert the category first — an interruption
+    // (a call, Siri) can hand the session back with different options.
+    if (active && !s_running)      { Q2_iOS_AudioApply(); [[AVAudioSession sharedInstance] setActive:YES error:nil]; AudioOutputUnitStart(s_au); s_running = true; }
     else if (!active && s_running) { AudioOutputUnitStop(s_au); s_running = false; }
 }
 
