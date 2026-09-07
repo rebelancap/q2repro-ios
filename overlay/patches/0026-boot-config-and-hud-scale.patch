@@ -1,0 +1,72 @@
+visionOS VR product round (R5): a boot-config writer, and a HUD-scale-only mode change.
+
+Two additive, unreferenced-on-desktop seams. See the comments at each site.
+
+--- a/inc/client/client.h	2026-08-31 02:15:48
++++ b/inc/client/client.h	2026-08-31 02:16:24
+@@ -95,6 +95,7 @@
+ void SCR_EndLoadingPlaque(void);
+ 
+ void SCR_ModeChanged(void);
++void SCR_HudScaleChanged(void);     // [overlay 0026] HUD scale only — see screen.c
+ void SCR_UpdateScreen(void);
+ 
+ // stats system
+--- a/src/client/main.c	2026-08-31 02:15:48
++++ b/src/client/main.c	2026-08-31 02:16:24
+@@ -2357,6 +2357,24 @@
+         Com_EPrintf("Error writing %s\n", COM_CONFIG_CFG);
+ }
+ 
++// [ios port overlay 0026] The boot config, written on demand.
++//
++// CL_WriteConfig is the ONLY writer of the file the engine execs at boot
++// (COM_CONFIG_CFG in the game directory — see FS_AddConfigFiles), and it runs from
++// CL_Shutdown. A mobile app never reaches CL_Shutdown: the OS kills it. So a phone or
++// headset shell has no way to persist settings into the file that is actually read, and
++// `writeconfig <name>` is not it — that command deliberately writes into `configs/`, which
++// is a *named saved config*, not the boot config. A shell that reached for it wrote a file
++// nothing has ever exec'd.
++//
++// Registered as a command rather than exported as a symbol because the shell already owns a
++// console seam (and only a console seam) for talking to the engine from its lifecycle
++// callbacks. Nothing on desktop calls it, so the reference build is unchanged.
++static void CL_WriteBootConfig_f(void)
++{
++    CL_WriteConfig();
++}
++
+ /*
+ ====================
+ CL_RestartFilesystem
+@@ -2684,6 +2702,7 @@
+     { "dumpstatusbar", CL_DumpStatusbar_f },
+     { "dumplayout", CL_DumpLayout_f },
+     { "writeconfig", CL_WriteConfig_f, CL_WriteConfig_c },
++    { "writeconfig_boot", CL_WriteBootConfig_f },   // [overlay 0026]
+     { "vid_restart", CL_RestartRefresh_f },
+     { "r_reload", CL_ReloadRefresh_f },
+ 
+--- a/src/client/screen.c	2026-08-31 02:15:48
++++ b/src/client/screen.c	2026-08-31 02:16:24
+@@ -1204,6 +1204,20 @@
+     } else {
+         scr.crosshair_color.b = (255 * (health - 66)) / 33;
+     }
++}
++
++// [ios port overlay 0026] Re-derive ONLY the HUD scale after r_config changed, with none of
++// SCR_ModeChanged's other work. A VR world frame lays its HUD out for a widescreen sub-rect
++// of a nearly-square eye target, so r_config changes twice per rendered frame — and at 90 Hz
++// neither Con_CheckResize's full console reflow nor UI_ModeChanged's menu rebuild can be paid
++// for twice a frame. Neither is needed there: a VR frame that has a menu or the console up is
++// routed to a different surface entirely, so the only 2D inside the bracket is the HUD, whose
++// layout depends on r_config and this scale and nothing else. Unused off that path — no
++// caller on desktop, so the reference build's behaviour is byte-identical.
++void SCR_HudScaleChanged(void)
++{
++    if (scr.initialized)
++        scr.hud_scale = R_ClampScale(scr_scale);
+ }
+ 
+ void SCR_ModeChanged(void)

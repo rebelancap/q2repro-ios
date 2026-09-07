@@ -1,0 +1,379 @@
+Subject: [overlay 0041] a shadow light must be culled by what it LIGHTS, not by where it sits
+
+Reported in the headset on rerelease data with per-pixel lighting on: "as you pass through
+certain areas, dynamic lighting will make portions of floors or walls dark. As you transition
+it might even be light in one eye, dark in the other. Before it's light in both, after it's
+dark in both." That is a hard step in the lighting of surfaces that never left view — not a
+fade, and not the per-eye stamp alias 0040 fixed (this one ends up dark in BOTH eyes).
+
+The mechanism, end to end:
+
+  1. A rerelease shadow light is a plain point ENTITY. subprojects/rerelease-game/rerelease/
+     g_misc.cpp setup_dynamic_light sets s.renderfx = RF_CASTSHADOW, a ZERO bbox, and no
+     SVF_NOCULL. Its parameters travel separately as CS_SHADOWLIGHTS configstrings, parsed
+     into cl.shadowdefs[] by CL_LoadShadowLight.
+  2. The SERVER decides per frame whether the client is told about that entity
+     (src/server/entities.c): entities without SVF_NOCULL are dropped when their area is not
+     connected or they are not visible, and an RF_CASTSHADOW entity is tested against the
+     client's PHS. PHS is broader than PVS but still asks about the LIGHT'S OWN LEAF — a
+     zero-size point that is usually stuck in a ceiling recess. Walk into a leaf whose PHS
+     does not include it and the light stops being sent.
+  3. The CLIENT then skips any shadow light whose entity is not in the current server frame
+     (CL_AddShadowLights: `if (ent->serverframe != cl.frame.number) continue;`).
+
+So the wall the light is illuminating stays in full view while the light that lights it is
+dropped, in one frame, at a leaf boundary. Both eyes see it, because the cull happens once per
+server frame; the transient per-eye version appears when a head pose has the two eyes
+straddling the boundary across a frame pair.
+
+The fix has two halves, because either alone is wrong:
+
+  A. Server: never position-cull an RF_CASTSHADOW entity (treat it like SVF_NOCULL in that one
+     condition). Shadow lights are static and delta-compressed, so after the first send they
+     cost essentially nothing per frame. SVF_NOCLIENT is untouched: the game still switches
+     lights on and off with it, and the client still honours the serverframe test, so a
+     switched-off light still goes away.
+
+  B. Client: cull by RELEVANCE instead. base1 alone defines 143 shadow lights against the
+     64-slot MAX_DLIGHTS cap, so "send them all" without a client cull would just move the
+     arbitrary drop into the eviction rescan. A light is relevant iff its bounding sphere
+     (the cone bounding sphere for a spot, as the renderer computes it) touches at least one
+     leaf whose cluster is in the view leaf's PVS — the question the server could not ask,
+     because only the client has the light's RADIUS. Every failure mode is conservative: no
+     map, no vis, view origin in solid, or a leaf list overflow all admit the light.
+     Irrelevance must be proven.
+
+  C. At the cap, 0039's eviction now ranks by intensity x lightstyle x fade x PROXIMITY,
+     where proximity = min(1, (radius / max(dist_to_view, radius))^2) — 1 while the viewer is
+     inside the light's own radius, inverse-square beyond it. Without it the 64 kept lights
+     are the brightest anywhere in the PVS, so a distant powerful light can hold a slot while
+     a dim one at the player's feet is dropped, which is exactly the step that is visible.
+     The proximity term is a RANKING key only: it lives in a parallel r_shadowlight_rank[]
+     array, never in dl->intensity, which is the value the shader renders with (folding it in
+     would have dimmed distant lights instead of merely deprioritising them). V_AddLight's
+     non-shadow entries still can never be evicted, as in 0039.
+
+  D. Instrument: V_AddLightEx returns whether the light got a slot, and CL_AddShadowLights
+     prints, under the existing gl_lightdiag cvar (0040),
+     `SHADOWDIAG total= sentbyserver= relevant= admitted= evicted=`.
+
+Nothing in the per-pixel shader, the dlight mask, or 0031/0039/0040's stamp logic is touched.
+Both halves are upstream defects and upstreamable as-is; nothing here is stereo-specific — a
+flat desktop takes the same path and steps the same way, it just has one eye to notice it with.
+
+Apply: patch -p1 -d vendor/q2repro < this
+--- a/src/server/entities.c
++++ b/src/server/entities.c
+@@ -684,7 +684,25 @@
+             continue;
+ 
+         // ignore if not touching a PV leaf
+-        if (ent != clent && !sv_novis->integer && !(ent->svflags & SVF_NOCULL)) {
++        //
++        // [vr overlay 0041] RF_CASTSHADOW entities are never position-culled. A rerelease
++        // shadow light is a plain point entity with a zero bbox (g_misc.cpp
++        // setup_dynamic_light) that carries no visible model of its own — what it carries is
++        // the LIGHT that falls on the walls and floors around it. Culling it against the
++        // client's PHS asks the wrong question: "can the player see the light's own leaf",
++        // not "can the player see anything the light lights". Cross into a leaf whose PHS
++        // omits the light's leaf and the client stops receiving the entity, CL_AddShadowLights
++        // skips it (ent->serverframe != cl.frame.number), and a wall still in plain view goes
++        // dark in one hard step. In VR the two eyes can even straddle the boundary within a
++        // frame pair, so one eye is lit and the other is not.
++        //
++        // Lights are static and delta-compressed: after the first send each one costs
++        // essentially nothing per frame, so sending them all is cheap. The client does the
++        // relevance culling instead (V_ShadowLightRelevant), where the light's own RADIUS is
++        // known and the right question can be asked. SVF_NOCLIENT is untouched — the game
++        // still turns lights on and off with it. Upstream defect, upstreamable as-is.
++        if (ent != clent && !sv_novis->integer && !(ent->svflags & SVF_NOCULL)
++            && !(ent->s.renderfx & RF_CASTSHADOW)) {
+             // check area
+             if (!CM_AreasConnected(client->cm, clientarea, ent->areanum)) {
+                 // doors can legally straddle two areas, so
+--- a/src/client/client.h
++++ b/src/client/client.h
+@@ -922,7 +922,15 @@
+ bool V_RenderSuppressed(void);
+ void V_AddEntity(const entity_t *ent);
+ void V_AddParticle(const particle_t *p);
+-void V_AddLightEx(cl_shadow_light_t *light);
++// [vr overlay 0041] returns true if the light occupies an r_dlights slot (false = faded
++// out, or outranked at the MAX_DLIGHTS cap). Callers may ignore it; CL_AddShadowLights
++// counts it for the SHADOWDIAG instrument.
++bool V_AddLightEx(cl_shadow_light_t *light);
++// [vr overlay 0041] shadow-light relevance cull, see view.c. Call V_UpdateShadowLightVis
++// once per frame (after cl.refdef.vieworg is set), then test each light.
++void V_UpdateShadowLightVis(void);
++bool V_ShadowLightRelevant(const cl_shadow_light_t *light);
++extern int r_shadowlight_evictions;
+ void V_AddLight(const vec3_t org, float intensity, float r, float g, float b);
+ void V_AddLightStyle(int style, float value);
+ void CL_UpdateBlendSetting(void);
+--- a/src/client/view.c
++++ b/src/client/view.c
+@@ -86,6 +86,13 @@
+ static int  r_shadowlight_slots[MAX_DLIGHTS];
+ static int  r_num_shadowlight_slots;
+ static int  r_weakest_shadowlight = -1;
++// [vr overlay 0041] The RANKING weight of each slot, kept apart from dl->intensity. 0039
++// compared dl->intensity, which is also the value the shader renders with — so any factor
++// folded into the ranking would have darkened the light as well. The proximity term below
++// must not do that, hence a parallel array.
++static float r_shadowlight_rank[MAX_DLIGHTS];
++// [vr overlay 0041] how many admitted shadowlights lost their slot this scene (instrument)
++int         r_shadowlight_evictions;
+ 
+ int         r_numentities;
+ entity_t    r_entities[MAX_ENTITIES];
+@@ -110,6 +117,7 @@
+     // [vr overlay 0039] the shadowlight priority bookkeeping is per-scene, like the arrays
+     r_num_shadowlight_slots = 0;
+     r_weakest_shadowlight = -1;
++    r_shadowlight_evictions = 0;    // [vr overlay 0041]
+ }
+ 
+ /*
+@@ -162,7 +170,84 @@
+     {
+         VectorMA(origin, size / (2.0f * c), forward, out);
+         out[3]   = size / (2.0f * c);
++    }
++}
++
++// [vr overlay 0041] CLIENT-SIDE RELEVANCE CULL FOR SHADOW LIGHTS.
++//
++// With the server no longer PHS-culling RF_CASTSHADOW entities (see src/server/entities.c),
++// the client receives every shadow light on the map — base1 alone defines 143 of them against
++// a 64-slot MAX_DLIGHTS cap. Sending all of them into V_AddLightEx would just move the
++// arbitrary drop from the server to the eviction rescan. So cull here, on the question that
++// actually matters: does this light's VOLUME touch anything the viewer can see?
++//
++// A light is relevant iff its bounding sphere (the cone bounding sphere for a spot) touches at
++// least one leaf whose cluster is in the view leaf's PVS. That is stable under motion in a way
++// the PHS-of-the-light's-own-leaf test is not: the sphere spans the leaves the light lights, so
++// it stops being relevant only once its lit volume has left the potentially visible set.
++//
++// Conservative in every failure mode: no map, no vis data, or a view origin in solid (cluster
++// < 0) admits everything, and a light whose sphere overflows the leaf list is admitted too —
++// irrelevance must be PROVEN, never assumed.
++static visrow_t v_shadowvis;
++static bool     v_shadowvis_valid;
++
++void V_UpdateShadowLightVis(void)
++{
++    const bsp_t *bsp = cl.bsp;
++    const mleaf_t *leaf;
++
++    v_shadowvis_valid = false;
++
++    if (!bsp || !bsp->nodes || !bsp->vis)
++        return;     // no map or no vis -> everything is relevant
++
++    leaf = BSP_PointLeaf(bsp->nodes, cl.refdef.vieworg);
++    if (!leaf || leaf->cluster < 0)
++        return;     // in solid / outside the world -> everything is relevant
++
++    BSP_ClusterVis(bsp, &v_shadowvis, leaf->cluster, DVIS_PVS);
++    v_shadowvis_valid = true;
++}
++
++#define V_SHADOWLIGHT_MAX_LEAFS 128
++
++bool V_ShadowLightRelevant(const cl_shadow_light_t *light)
++{
++    const mleaf_t *leafs[V_SHADOWLIGHT_MAX_LEAFS];
++    vec4_t  sphere;
++    vec3_t  mins, maxs;
++    int     count, i;
++
++    if (!v_shadowvis_valid)
++        return true;
++
++    if (light->coneangle) {
++        float a = DEG2RAD(light->coneangle);
++        cone_to_bounding_sphere(light->origin, light->conedirection, light->radius,
++                                a, cosf(a), sinf(a), sphere);
++    } else {
++        VectorCopy(light->origin, sphere);
++        sphere[3] = light->radius;
+     }
++
++    for (i = 0; i < 3; i++) {
++        mins[i] = sphere[i] - sphere[3];
++        maxs[i] = sphere[i] + sphere[3];
++    }
++
++    count = CM_BoxLeafs_headnode(mins, maxs, leafs, V_SHADOWLIGHT_MAX_LEAFS,
++                                 cl.bsp->nodes, NULL);
++    if (count >= V_SHADOWLIGHT_MAX_LEAFS)
++        return true;    // list overflowed: cannot prove irrelevance, so keep the light
++
++    for (i = 0; i < count; i++) {
++        int cluster = leafs[i]->cluster;
++        if (cluster >= 0 && Q_IsBitSet(v_shadowvis.b, cluster))
++            return true;
++    }
++
++    return false;
+ }
+ 
+ // calculate the fade distance from screen to light
+@@ -191,14 +276,15 @@
+ 
+ =====================
+ */
+-void V_AddLightEx(cl_shadow_light_t *light)
++bool V_AddLightEx(cl_shadow_light_t *light)
+ {
+     dlight_t    *dl;
++    int         slot;
+ 
+     float fade = fade_distance_to_light((const vec2_t) { light->fade_start, light->fade_end }, light->origin, cl.refdef.vieworg);
+ 
+     if (fade <= 0.0f)
+-        return;
++        return false;
+ 
+     // [vr overlay 0039] The weight this light would carry if it were admitted. Identical to
+     // the dl->intensity that used to be computed below, hoisted so it can be compared with
+@@ -219,22 +305,40 @@
+     // contributing least, so the step happens where it is invisible. Cost: one float compare
+     // per light, plus a 64-entry rescan on the rare eviction. Zero GPU cost. Upstream bug,
+     // upstreamable as-is.
++    //
++    // [vr overlay 0041] The ranking weight adds PROXIMITY TO THE VIEWER, and lives in
++    // r_shadowlight_rank, not in dl->intensity — dl->intensity is what the shader renders
++    // with, so folding proximity into it would dim distant lights instead of merely ranking
++    // them. Without this term the 64 kept lights are the 64 brightest anywhere on the map,
++    // which on base1 means a far-off bright light can hold a slot while a dim one three feet
++    // from the player's face is dropped; the drop is exactly the visible step. proximity is 1
++    // inside the light's own radius and falls off inverse-square beyond it, so a light is
++    // never demoted while the viewer stands in it.
++    float dist = VectorDistance(cl.refdef.vieworg, light->origin);
++    float ratio = light->radius / max(dist, max(light->radius, 1.0f));
++    float proximity = min(1.0f, ratio * ratio);
++    float rank = weight * proximity;
++
+     if (r_numdlights < MAX_DLIGHTS) {
+-        if (r_weakest_shadowlight < 0 || weight < r_dlights[r_weakest_shadowlight].intensity)
+-            r_weakest_shadowlight = r_numdlights;
+-        r_shadowlight_slots[r_num_shadowlight_slots++] = r_numdlights;
+-        dl = &r_dlights[r_numdlights++];
++        slot = r_numdlights++;
++        r_shadowlight_rank[slot] = rank;
++        r_shadowlight_slots[r_num_shadowlight_slots++] = slot;
++        if (r_weakest_shadowlight < 0 || rank < r_shadowlight_rank[r_weakest_shadowlight])
++            r_weakest_shadowlight = slot;
++        dl = &r_dlights[slot];
+     } else {
+         // Only slots this function owns may be evicted: V_AddLight's entries (muzzle flashes,
+         // rockets, explosions) store a radius in dl->radius and a flat 1.0 in dl->intensity,
+         // so their intensity is not comparable and they must never lose their slot to a
+         // static map light.
+-        if (r_weakest_shadowlight < 0 || weight <= r_dlights[r_weakest_shadowlight].intensity)
+-            return;
+-        dl = &r_dlights[r_weakest_shadowlight];
+-        dl->intensity = weight;     // so the rescan below weighs the replacement, not the evictee
++        if (r_weakest_shadowlight < 0 || rank <= r_shadowlight_rank[r_weakest_shadowlight])
++            return false;
++        slot = r_weakest_shadowlight;
++        dl = &r_dlights[slot];
++        r_shadowlight_rank[slot] = rank;    // rescan below weighs the replacement, not the evictee
++        r_shadowlight_evictions++;
+         for (int i = 0; i < r_num_shadowlight_slots; i++)
+-            if (r_dlights[r_shadowlight_slots[i]].intensity < r_dlights[r_weakest_shadowlight].intensity)
++            if (r_shadowlight_rank[r_shadowlight_slots[i]] < r_shadowlight_rank[r_weakest_shadowlight])
+                 r_weakest_shadowlight = r_shadowlight_slots[i];
+     }
+ 
+@@ -258,6 +362,8 @@
+ 
+     dl->fade[0] = light->fade_start;
+     dl->fade[1] = light->fade_end;
++
++    return true;    // [vr overlay 0041] this light occupies a slot (instrument)
+ }
+ 
+ /*
+--- a/src/client/effects.c
++++ b/src/client/effects.c
+@@ -28,6 +28,7 @@
+ static cvar_t *cl_rerelease_effects;
+ static cvar_t *cl_muzzlelight_time;
+ cvar_t *cl_shadowlights;
++static cvar_t *cl_lightdiag;    // [vr overlay 0041] shared with the refresh's gl_lightdiag
+ 
+ /*
+ ==============================================================
+@@ -1854,18 +1855,32 @@
+ */
+ void CL_AddShadowLights(void)
+ {
++    // [vr overlay 0041] SHADOWDIAG counters, see the print at the end of this function
++    int total = 0, sent = 0, relevant = 0, admitted = 0;
++
+     if (!cl_shadowlights->integer || !R_SupportsPerPixelLighting())
+         return;
++
++    // [vr overlay 0041] one PVS row per frame for the relevance cull below
++    V_UpdateShadowLightVis();
+ 
+     for (size_t i = 0; i < cl.csr.max_shadowlights; i++) {
+         if (!*cl.configstrings[cl.csr.shadowlights + i])
+             continue;
+ 
++        total++;
++
+         centity_t *ent = &cl_entities[cl.shadowdefs[i].number];
+ 
++        // The entity still gates the light: the game turns lights on and off with
++        // SVF_NOCLIENT, and an entity never received has no valid origin. What it no longer
++        // gates is POSITION — 0041 stops the server PHS-culling RF_CASTSHADOW entities, so a
++        // light that vanishes here has been switched off, not walked away from.
+         if (ent->serverframe != cl.frame.number)
+             continue;
+ 
++        sent++;
++
+         color_t color;
+         if (!ent->current.skinnum)
+             color = COLOR_WHITE;
+@@ -1877,8 +1892,28 @@
+         VectorCopy(ent->current.origin, cl.shadowdefs[i].light.origin);
+         cl.shadowdefs[i].light.color = color;
+ 
+-        V_AddLightEx(&cl.shadowdefs[i].light);
++        // [vr overlay 0041] base1 defines 143 shadow lights against a 64-slot cap, so the
++        // client does the culling the server used to do badly — by the light's own volume
++        // against the view PVS, not by the light's leaf against the view PHS.
++        if (!V_ShadowLightRelevant(&cl.shadowdefs[i].light))
++            continue;
++
++        relevant++;
++
++        if (V_AddLightEx(&cl.shadowdefs[i].light))
++            admitted++;
+     }
++
++    // [vr overlay 0041] the instrument. Shares gl_lightdiag with overlay 0040's LIGHTDIAG /
++    // LIGHTALIAS lines so one cvar turns the whole light pipeline's diagnostics on:
++    //   total        shadow lights defined by the map (configstrings)
++    //   sentbyserver received in this server frame (i.e. not switched off)
++    //   relevant     whose bounding sphere touches the view PVS
++    //   admitted     that actually got an r_dlights slot
++    //   evicted      admitted lights that later lost their slot at the cap
++    if (cl_lightdiag->integer)
++        Com_Printf("SHADOWDIAG total=%d sentbyserver=%d relevant=%d admitted=%d evicted=%d\n",
++                   total, sent, relevant, admitted, r_shadowlight_evictions);
+ }
+ 
+ /*
+@@ -1906,4 +1941,7 @@
+     cl_rerelease_effects = Cvar_Get("cl_rerelease_effects", "1", 0);
+     cl_muzzlelight_time = Cvar_Get("cl_muzzlelight_time", "100", 0);
+     cl_shadowlights = Cvar_Get("cl_shadowlights", "1", 0);
++    // [vr overlay 0041] same cvar the refresh registers for LIGHTDIAG/LIGHTALIAS (0040);
++    // Cvar_Get returns the existing one whichever subsystem asks first.
++    cl_lightdiag = Cvar_Get("gl_lightdiag", "0", 0);
+ }

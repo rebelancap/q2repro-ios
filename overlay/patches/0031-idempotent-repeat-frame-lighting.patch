@@ -1,0 +1,125 @@
+Subject: [overlay 0031] R_SetRepeatFrame — the second eye reuses the dlight state, not consumes it
+
+Companion to 0030. With the render count fixed at two per host frame, the two renders still
+disagree about lighting, because R_RenderFrame CONSUMES dynamic-light state:
+
+  * GL_MarkLights/GL_TransformLights bump glr.dlightframe and stamp every lit face with it;
+  * GL_PushLights, on a face whose stamp is not the current one, zeroes the stamp and rebuilds
+    that face's lightmap WITHOUT its dynamic light;
+  * only the faces THIS render's node walk drew get re-pushed.
+
+So the second eye re-stamped everything with a new number and any face it did not reach was
+scrubbed clean by the next render that did. One face re-pushed and its neighbour not is the
+wall with a bright half and a dark half; the same thing beating against the frame cadence is
+the flicker.
+
+R_SetRepeatFrame(true) marks the next render as a repeat: it rewinds glr.dlightframe to
+glr.dlightframe_base, the value the host frame's first render started from, so GL_MarkLights
+re-marks with the SAME stamp — same bits, same lights, same order — and nothing is
+invalidated. GL_PushLights' stylecache is per-surface and consumed only by a render that
+actually drew that surface, so a surface outside eye 0's node walk but inside eye 1's is
+still pushed; a surface both eyes draw is pushed twice with identical content.
+
+Second, independent bug fixed here: update_dynamic_lightmap zeroed a stale surf->dlightframe
+but left surf->dlightbits, which world.c clears only on a re-mark and tess.c reads
+unconditionally — a face could contribute dynamic light for lights its lightmap had just been
+rebuilt without. The bits are now dropped with the stamp, except under per-pixel lighting
+where they are that frame's shader light list rather than a lightmap companion.
+
+Not addressed: shader_load_lights frustum-culls dlights per eye and glr.ppl_dlight_bits does
+not encode which survived. In-game only, per-pixel-lighting only, and not a one-liner.
+
+Apply: patch -p1 -d vendor/q2repro < this
+--- a/inc/refresh/refresh.h
++++ b/inc/refresh/refresh.h
+@@ -226,6 +226,7 @@
+ #define R_RegisterSkin(name)    R_RegisterImage(name, IT_SKIN, IF_NONE)
+ #define R_RegisterSprite(name)  R_RegisterImage(name, IT_SPRITE, IF_NONE)
+ 
++void    R_SetRepeatFrame(bool repeat);      // [vr overlay 0031] next frame repeats the last
+ void    R_RenderFrame(const refdef_t *fd);
+ void    R_LightPoint(const vec3_t origin, vec3_t light);
+ 
+--- a/src/refresh/gl.h
++++ b/src/refresh/gl.h
+@@ -139,6 +139,12 @@
+     unsigned        visframe;
+     unsigned        drawframe;
+     unsigned        dlightframe;
++    // [vr overlay 0031] The stereo shell renders the same host frame twice, once per eye.
++    // dlightframe_base is the value dlightframe held when the FIRST render of the host frame
++    // started; repeat_frame marks the second one, which rewinds to it so GL_MarkLights
++    // re-marks with the stamps the surfaces already carry instead of invalidating them.
++    unsigned        dlightframe_base;
++    bool            repeat_frame;
+     int             viewcluster1;
+     int             viewcluster2;
+     int             nodes_visible;
+--- a/src/refresh/main.c
++++ b/src/refresh/main.c
+@@ -841,6 +841,13 @@
+     }
+ 
+     return flags;
++}
++
++// [vr overlay 0031] Marks the next R_RenderFrame as a repeat of the previous one (the stereo
++// shell's second eye), so it reuses rather than consumes the frame's dynamic-light state.
++void R_SetRepeatFrame(bool repeat)
++{
++    glr.repeat_frame = repeat;
+ }
+ 
+ void R_RenderFrame(const refdef_t *fd)
+@@ -850,6 +857,27 @@
+     Q_assert(gl_static.world.cache || (fd->rdflags & RDF_NOWORLDMODEL));
+ 
+     glr.drawframe++;
++
++    // [vr overlay 0031] LIGHTING IDEMPOTENCE FOR THE SECOND EYE. R_RenderFrame consumes
++    // dynamic-light state: GL_MarkLights bumps glr.dlightframe and stamps every lit face with
++    // it, and GL_PushLights treats a face whose stamp is not the current one as stale — it
++    // zeroes the stamp and rebuilds that face's lightmap WITHOUT its dynamic light. Rendering
++    // the same frame a second time for the other eye therefore re-stamped everything with a
++    // NEW number, and any face the second render's node walk did not reach kept the old one
++    // and got scrubbed clean on the next render that did reach it. One face re-pushed and its
++    // neighbour not is "the left half of the wall is bright and the right half is dark", and
++    // the whole thing beating against the frame cadence is the flicker.
++    //
++    // The repeat render rewinds to the stamp the first render of this host frame used, so
++    // GL_MarkLights re-marks with the SAME number: every face keeps a live stamp and the
++    // dlightbits ORed in are the same bits from the same lights in the same order. Faces the
++    // first eye did not draw are still pushed by the second (GL_PushLights' style cache is
++    // per-surface and only the render that actually drew a surface consumes it), and faces
++    // both eyes draw are pushed twice with identical content.
++    if (glr.repeat_frame)
++        glr.dlightframe = glr.dlightframe_base;
++    else
++        glr.dlightframe_base = glr.dlightframe;
+ 
+     glr.fd = *fd;
+     glr.ppl_bits  = 0;
+--- a/src/refresh/surf.c
++++ b/src/refresh/surf.c
+@@ -240,10 +240,19 @@
+     add_light_styles(surf);
+ 
+     // add all the dynamic lights
+-    if (surf->dlightframe == glr.dlightframe && !gl_backend->use_per_pixel_lighting())
++    if (surf->dlightframe == glr.dlightframe && !gl_backend->use_per_pixel_lighting()) {
+         add_dynamic_lights(surf);
+-    else
++    } else {
++        // [vr overlay 0031] The bits belong to the stamp being dropped. This lightmap has just
++        // been rebuilt WITHOUT its dynamic lights, but dlightbits is only ever cleared on a
++        // re-mark (world.c) and is read unconditionally in tess.c — so a face left here with
++        // live bits and a dead stamp got a dynamic-light contribution the lightmap under it no
++        // longer had. Under per-pixel lighting the bits ARE this frame's light list for the
++        // shader pass rather than a lightmap stamp's companion, so they are left alone there.
+         surf->dlightframe = 0;
++        if (!gl_backend->use_per_pixel_lighting())
++            surf->dlightbits = 0;
++    }
+ 
+     // put into texture format
+     put_blocklights(surf);

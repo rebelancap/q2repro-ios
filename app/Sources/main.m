@@ -28,7 +28,7 @@ extern void VID_iOS_Resize(void);   // window resized (visionOS): rebuild the dr
 extern void VID_iOS_RequestCapture(const char *path);
 extern void VID_iOS_AddLook(float dx, float dy);
 extern void VID_iOS_Command(const char *cmd);
-extern void CL_SetAnalogMove(float forward, float side);   // analog move axis [-1,1]
+extern void VID_iOS_AnalogMove(float forward, float side);   // analog move axis [-1,1], funnelled
 extern void CL_Activate(int active);
 #define ACT_MINIMIZED 0
 #define ACT_ACTIVATED 2
@@ -43,6 +43,30 @@ enum { IOS_MENU_CLICK = 0, IOS_MENU_UP, IOS_MENU_DOWN, IOS_MENU_LEFT,
 // Audio session policy + master mix gain — ios_audio.m.
 extern void  Q2_iOS_AudioBoot(void);
 extern void  Q2_iOS_AudioTick(void);
+extern void  Q2_VR_Tick(void);        // q2_vr_dumps.m — black box flush (coalesced ~1 Hz)
+extern void  Q2_VR_SetMode(int mode); // q2_vr_dumps.m — 0 = 2D window, 1 = 3D panel, 2 = VR
+extern int   Q2_VR_Mode(void);
+extern void  Q2_VR_Log(const char *msg);
+// [R14b] The crash marker: armed while the app is in the FOREGROUND, cleared on a clean
+// background. A marker still set at the next launch is the only trace a jetsam kill leaves.
+extern void  Q2_VR_MarkRunning(int running);   // q2_vr_dumps.m
+#if defined(Q2_XR_UI) && Q2_XR_UI
+#include <stdatomic.h>
+// q2_vr_input.m — the merged pad snapshot, and the crash-safe cvar stash.
+extern void  Q2_VR_PadSticks(float lx, float ly, float rx, float ry, int injected);
+extern void  Q2_VR_PadClear(void);
+extern void  Q2_VR_PadClearPad(void);
+extern void  Q2_VR_StashCvars(void);
+extern void  Q2_VR_RestoreCvars(void);
+extern void  Q2_VR_RepairLeftoverStash(void);
+extern void  Q2_VR_RegisterInputCommands(void);
+#if defined(Q2_XR_UI) && Q2_XR_UI
+extern int   Q2_VR_SenseShouldIgnoreGamepad(const char *name);   // q2_vr_sense.m
+extern int   Q2_VR_SenseOrdinaryPadCount(void);
+extern void  Q2_VR_HandsUIFrame(void);                           // q2_vr_hands.m
+#endif
+extern void  VID_iOS_XR3_SetUIRedirect(int on);
+#endif
 // iOS settings cvars — ios_bridge.m.
 extern void  VID_iOS_RegisterCvars(void);
 extern float VID_iOS_SensX(void);
@@ -61,6 +85,8 @@ extern bool VID_iOS_KeyIsWaiting(void);
 extern int  VID_iOS_PassiveState(void);   // 0 interactive, 1 demo, 2 cinematic
 extern bool VID_iOS_Disconnected(void);   // no server/demo/cinematic → attract may start
 extern void VID_iOS_SkipCinematic(void);
+extern void VID_iOS_PadStartButton(void);   // [R7b] the ONE Start body
+extern void Q2_iOS_MenuPauseTick(void);     // [R7b] menu-pause reconciliation
 extern void VID_iOS_LookDelta(float yaw, float pitch);    // absolute degrees (touch/gyro)
 extern void VID_iOS_LookAnalog(float yaw, float pitch);   // stick rate (pre-scaled)
 #if defined(Q2_XR_UI) && Q2_XR_UI
@@ -68,6 +94,7 @@ extern void VID_iOS_LookAnalog(float yaw, float pitch);   // stick rate (pre-sca
 // complete frame twice per engine step — left/right eye, same game time.
 extern int  VID_iOS_XR3_Active(void);
 extern void VID_iOS_XR3_SetMode(int on);
+#include "immersive/q2_vr_glue.h"        // VR rendezvous, engine thread, depth handoff
 extern void VID_iOS_XR3_BeginEye(int eye, float halfSep, float convergence);
 extern void VID_iOS_XR3_EndFrame(void);
 extern void SCR_UpdateScreen(void);
@@ -232,7 +259,20 @@ static __weak GLView *g_touchView;
     [self bringSubviewToFront:_touchCursor];
 }
 
+// While VR owns the presentation the game window is parked behind an opaque curtain and is
+// not a gameplay surface. A touch that reached the funnel from there would inject a move or a
+// key the player cannot see themselves making — and worse, a touch in flight when the space
+// opened would never get its touchesEnded, so the latch would hold forever. Gamepad is the
+// input story in VR; touch is not, and saying so once at the source beats gating six
+// producers.
+#if defined(Q2_XR_UI) && Q2_XR_UI
+#define Q2_TOUCH_DEAD_IN_VR()  do { if (Q2_VR_Mode() == 2) return; } while (0)
+#else
+#define Q2_TOUCH_DEAD_IN_VR()  do { } while (0)
+#endif
+
 - (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)e {
+    Q2_TOUCH_DEAD_IN_VR();
     if (_editing) { [self editDragBegin:[touches.anyObject locationInView:self]]; return; }
     // Attract sequence: tap skips the intro cinematic / opens the menu over the demo.
     int ps = VID_iOS_PassiveState();
@@ -249,9 +289,13 @@ static __weak GLView *g_touchView;
     // — that's the "look drag stops working after I hit fire" bug.
     NSSet *active = e.allTouches;
     if (_lookTouch && ![active containsObject:_lookTouch]) _lookTouch = nil;
-    if (_moveTouch && ![active containsObject:_moveTouch]) { _moveTouch = nil; CL_SetAnalogMove(0,0); [self hideStick]; }
+    if (_moveTouch && ![active containsObject:_moveTouch]) { _moveTouch = nil; VID_iOS_AnalogMove(0,0); [self hideStick]; }
 
+#if defined(Q2_XR_UI) && Q2_XR_UI
+    if (Q2_VR_SenseOrdinaryPadCount() > 0) return;    // ordinary pad only — a Sense half is not one
+#else
     if (GCController.controllers.count > 0) return;   // gamepad connected → ignore touch move/look
+#endif
     for (UITouch *t in touches) {
         CGPoint p = [t locationInView:self];
         // The move stick is a ZONE, not the left half: a touch inside the (draggable) zone
@@ -262,6 +306,7 @@ static __weak GLView *g_touchView;
 }
 
 - (void)touchesMoved:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)e {
+    Q2_TOUCH_DEAD_IN_VR();
     if (_editing) { [self editDragMove:[touches.anyObject locationInView:self]]; return; }
     if (VID_iOS_MenuActive()) { [self menuTouch:touches.anyObject]; return; }
     for (UITouch *t in touches) {
@@ -275,7 +320,7 @@ static __weak GLView *g_touchView;
             CGFloat dx = p.x - _moveOrigin.x, dy = p.y - _moveOrigin.y;
             CGFloat d = hypot(dx, dy);
             if (d > STICK_RADIUS) { dx *= STICK_RADIUS/d; dy *= STICK_RADIUS/d; }
-            CL_SetAnalogMove((float)(-dy / STICK_RADIUS), (float)(dx / STICK_RADIUS));  // analog: up=forward
+            VID_iOS_AnalogMove((float)(-dy / STICK_RADIUS), (float)(dx / STICK_RADIUS));  // analog: up=forward
             [self moveKnob:p];
         } else if (t == _lookTouch) {
             // Direct-degree look (bypasses engine sensitivity/accel): ios_sens_* is the sole control.
@@ -294,15 +339,15 @@ static __weak GLView *g_touchView;
     for (UITouch *t in touches) {
         if (t == _moveTouch) {
             _moveTouch = nil;
-            CL_SetAnalogMove(0, 0);
+            VID_iOS_AnalogMove(0, 0);
             [self hideStick];
         } else if (t == _lookTouch) {
             _lookTouch = nil;
         }
     }
 }
-- (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)e { [self endTouches:touches]; }
-- (void)touchesCancelled:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)e { [self endTouches:touches]; }
+- (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)e { Q2_TOUCH_DEAD_IN_VR(); [self endTouches:touches]; }
+- (void)touchesCancelled:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)e { Q2_TOUCH_DEAD_IN_VR(); [self endTouches:touches]; }
 
 // ---- On-screen touch buttons (Fable-style unit-anchored layout) -------------
 // Buttons send KEX virtual keys so they share binds with the controller. Hold
@@ -577,7 +622,7 @@ static __weak GLView *g_touchView;
 // Release every in-flight input so entering edit mode never leaves a key/button asserted.
 - (void)releaseAllInput {
     _moveTouch = nil; _lookTouch = nil;
-    CL_SetAnalogMove(0, 0);
+    VID_iOS_AnalogMove(0, 0);
     [self hideStick];
     VID_iOS_Command("-attack"); VID_iOS_Command("-moveup"); VID_iOS_Command("-movedown");
     VID_iOS_Command("-wheel2");
@@ -827,7 +872,14 @@ static __weak GLView *g_touchView;
     CGFloat scale = VID_iOS_TouchScale(), alpha = VID_iOS_TouchAlpha();
     BOOL inMenu = VID_iOS_MenuActive();
     BOOL passive = VID_iOS_PassiveState() != 0;         // demo / cinematic playing
+#if defined(Q2_XR_UI) && Q2_XR_UI
+    // Ordinary pads only: a Sense half enumerates as a gamepad once the declaration is in
+    // place, and counting it here would hide the touch controls the moment a controller was
+    // switched on in the 2D window.
+    BOOL pad = Q2_VR_SenseOrdinaryPadCount() > 0;
+#else
     BOOL pad = GCController.controllers.count > 0;      // a gamepad is connected
+#endif
     BOOL hideGame = (inMenu || passive || pad) && !editing;   // controls only during live touch play (editor overrides)
     if (pad) VID_iOS_SetWheelAnchor(-1, -1);            // controller → wheel renders at default centre
     BOOL layoutUp = VID_iOS_LayoutActive();             // Action join/loadout menu on screen
@@ -1060,7 +1112,80 @@ static int cmp_double(const void *x, const void *y) {   // ascending, for percen
 @property(nonatomic, assign) int shots;                // -shots launch arg: N periodic screenshots left
 @property(nonatomic, assign) int attractDisc;          // consecutive idle+disconnected frames (attract debounce)
 - (void)bringUpGameInWindow:(UIWindow *)window scale:(CGFloat)scale;   // shared iOS + visionOS bring-up
+#if defined(Q2_XR_UI) && Q2_XR_UI
+@property(nonatomic, strong) dispatch_source_t vrPadTimer;
+- (void)startVRPadTimer;
+- (void)stopVRPadTimer;
+#endif
 @end
+
+// ==================== [R16] DISPLAY-LINK OWNERSHIP ====================
+// While the immersive space is up, the VR ENGINE THREAD owns Qcommon_Frame and the ANGLE
+// context (Q2_VR_StartEngineThread), and the main-thread display link is paused for exactly
+// that reason — not as an optimisation. Anything that unpauses the link behind VR's back
+// therefore puts a SECOND thread into Qcommon_Frame with no GL context of its own: torn
+// refdefs (a duplicate of the world flashing beside the real one), entity lists rebuilt
+// mid-render (bodies and items gone for a frame), per-eye light-stamp divergence, and GL
+// errors from the context-less side. Whether such an unpause lands BEFORE or AFTER the entry
+// pause is pure timing — which is precisely the "flicker comes and goes per VR entry, and a
+// different eye each time" the headset reports.
+//
+// So: one funnel for every pause/unpause (q2_link_set), which REFUSES an unpause while the
+// engine thread runs and records who asked; and a guard at the top of -tick that refuses to
+// drive the engine from the main thread in VR, counts the ticks and re-pauses. Transitions
+// are rare, so every one of them is logged with its reason.
+//
+// Q2_NO_MAINTICK_GUARD=1 compiles BOTH refusals out — the funnel's and -tick's — leaving only
+// the counter and the MAINTICK log. That is the "before" arm of the A/B: the link really does
+// get unpaused in VR and the main thread really does drive the engine, so the mechanism can be
+// observed rather than assumed. It must never be defined in a shipping build.
+#include <stdatomic.h>   // iOS too: the XR block above only includes it under Q2_XR_UI
+static atomic_uint            q2_main_ticks_in_vr;   // main ticks that fired while VR owned the frame
+static atomic_bool            q2_maintick_logged;    // one line per VR session, never per frame
+static _Atomic(const char *)  q2_link_reason;        // who last touched the link
+
+unsigned    Q2_VR_MainTicksInVR(void) { return atomic_load(&q2_main_ticks_in_vr); }
+const char *Q2_VR_LinkReason(void)    { const char *r = atomic_load(&q2_link_reason); return r ? r : "boot"; }
+void        Q2_VR_ResetMainTicksInVR(void) {
+    atomic_store(&q2_main_ticks_in_vr, 0u);
+    atomic_store(&q2_maintick_logged, false);
+}
+
+static int q2_vr_owns_frame(void) {
+#if defined(Q2_XR_UI) && Q2_XR_UI
+    return Q2_VR_EngineThreadRunning();
+#else
+    return 0;
+#endif
+}
+
+static void q2_link_log(AppDelegate *app, const char *line) {
+    if (app.engineStarted) Q2_VR_Log(line);
+    else                   NSLog(@"[q2repro] %s", line);
+}
+
+static void q2_link_set(AppDelegate *app, BOOL paused, const char *reason) {
+    if (!app.link) return;
+    char line[192];
+    atomic_store(&q2_link_reason, reason);
+#if !defined(Q2_NO_MAINTICK_GUARD) || !Q2_NO_MAINTICK_GUARD
+    if (!paused && q2_vr_owns_frame()) {
+        // The whole point of the round: an unpause during VR is a bug wherever it comes from.
+        snprintf(line, sizeof line,
+                 "LINK unpause REFUSED reason=%s (VR engine thread owns the frame)", reason);
+        q2_link_log(app, line);
+        app.link.paused = YES;
+        return;
+    }
+#endif   // Q2_NO_MAINTICK_GUARD also lifts the FUNNEL's refusal — otherwise the A/B's
+         // "before" arm never lets the unpause through and cannot show the mechanism.
+    BOOL was = app.link.paused;
+    app.link.paused = paused;
+    if (was != paused) {
+        snprintf(line, sizeof line, "LINK paused=%d reason=%s", paused ? 1 : 0, reason);
+        q2_link_log(app, line);
+    }
+}
 
 #if TARGET_OS_VISION
 // visionOS window lifecycle. A UIKit-native visionOS app runs in a proper 2D
@@ -1417,6 +1542,193 @@ static NSString *DocsDir(void) {
     }
 }
 
+// ---- the boot config (Q-VR7) ------------------------------------------------------------
+// THE BUG THIS EXISTS FOR, stated plainly: until this round no setting this app ever wrote
+// survived a relaunch, on ANY platform. The shell persisted with `writeconfig
+// q2reproconfig.cfg`, which writes `<home>/<game>/configs/q2reproconfig.cfg` — a *named
+// saved config*, the engine's equivalent of "File > Save As". The file the engine execs at
+// boot (FS_AddConfigFiles → COM_CONFIG_CFG) is `<home>/<game>/q2reproconfig.cfg`, at the game
+// directory root, and on desktop only CL_WriteConfig writes it — from CL_Shutdown, which a
+// mobile app never reaches because the OS kills it instead of quitting it. Two files, one
+// written and never read, one read and never written.
+//
+// The fix is in two halves and BOTH are needed. Overlay 0026 adds `writeconfig_boot`, so
+// from here on the shell writes the root file the engine actually reads, exactly the file
+// desktop writes on quit. This function is the other half: the one-time carry-across of the
+// legacy `configs/` file, so a player's accumulated settings finally take effect instead of
+// being silently discarded on the day the read starts working.
+//
+// AND THE REASON IT IS NOT A COPY. That legacy file has been written blind for the app's
+// whole life, including by 1.0.11.2, whose VR exit persisted the VR overrides into it
+// (D-VR-R2.1 finding 2). Turning the read on with a plain copy would newly APPLY the exact
+// damage 1.0.11.3 exists to stop — a bug that was cosmetically invisible for months would
+// become visible on upgrade, which is the worst possible time. So the carry-across
+// sanitises for that one signature, and only that one.
+//
+// THE SIGNATURE, AND WHY IT IS TWO ROWS AND NOT THREE (D-VR-R5.1). Through 1.0.11.7 the
+// signature required all THREE of `gl_shadows "0"`, `viewsize "100"` and
+// `gl_multisamples "0"`. That third row can never appear: gl_multisamples is CVAR_REFRESH
+// (vendor/q2repro/src/refresh/main.c:1536), not CVAR_ARCHIVE, and the only writer of this
+// file is CL_WriteConfig → `Cvar_WriteVariables(f, CVAR_ARCHIVE, false)`, which skips
+// anything without the archive flag. So NO config the engine has ever written — including
+// the ones 1.0.11.2 itself wrote — contains it, the match never fired, and .7 shipped a
+// sanitiser that was dead code carrying .2 damage across verbatim. The signature is now the
+// two rows .2 actually archived.
+//
+// AND WHAT THAT SIGNATURE REALLY MEANS. That same call passes modified=false, so
+// Cvar_WriteVariables writes EVERY archived cvar including ones still at their default —
+// there is no "only if changed" filter. viewsize is CVAR_ARCHIVE with default "100", so
+// `seta viewsize "100"` is in essentially every config ever written. The two-row signature
+// therefore degenerates, for all but the few players who moved viewsize off 100, to
+// `gl_shadows "0"` alone. That is understood and accepted, not overlooked: the trade is a
+// player who legitimately turned shadows off before .7 gets shadows reset to the default
+// ONCE, visibly, and re-settable in one menu row (Options > Effects > ground shadows) —
+// versus a .2 victim silently losing shadows forever with no way to know why. A one-time
+// migration is exactly the place to take that trade.
+//
+// When the signature matches, those rows are DROPPED (so the engine's own defaults apply —
+// no value is invented here) and everything else in the file is carried over untouched.
+// When it does not match, the file is carried over verbatim. Nothing is deleted: the legacy
+// file stays exactly where it was.
+//
+// Exactly-once by construction. The marker is the destination itself: a root config that
+// already exists is either a migration that already happened or a file the engine wrote, and
+// either way it is the live config and must not be touched. There is no separate flag to get
+// out of sync with the filesystem.
+
+// The .2 clobber signature, written by Cvar_WriteVariables as `seta <name> "<value>"`.
+// NOT gl_multisamples: it is CVAR_REFRESH and is never archived — see the note above.
+static NSArray<NSString *> *Q2BootCfgDamageSignature(void)
+{
+    static NSArray<NSString *> *sig;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ sig = @[@"seta gl_shadows \"0\"", @"seta viewsize \"100\""]; });
+    return sig;
+}
+
+// Drops the signature rows if ALL of them are present; otherwise returns the text unchanged.
+// Shared by the legacy carry-across and by the .7-victim heal so the two can never drift.
+static NSString *Q2BootCfgSanitise(NSString *text, NSString *header, BOOL *outSanitised)
+{
+    NSArray<NSString *> *sig = Q2BootCfgDamageSignature();
+    NSArray<NSString *> *lines = [text componentsSeparatedByString:@"\n"];
+    NSMutableSet<NSString *> *seen = [NSMutableSet set];
+    for (NSString *raw in lines) {
+        NSString *l = [raw stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+        if ([sig containsObject:l]) [seen addObject:l];
+    }
+    BOOL clobbered = (seen.count == sig.count);
+    if (outSanitised) *outSanitised = clobbered;
+
+    NSMutableString *out = [NSMutableString string];
+    if (header.length) [out appendString:header];
+    if (clobbered)
+        [out appendString:@"// the 1.0.11.2 VR-exit clobber was found in it and those rows were\n"
+                          @"// dropped, so the engine's own defaults apply to them.\n"];
+    for (NSString *raw in lines) {
+        NSString *l = [raw stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+        if (clobbered && [sig containsObject:l]) continue;
+        [out appendFormat:@"%@\n", raw];
+    }
+    return out;
+}
+static char s_bootcfg_report[512] = "BOOTCFGNOW state=notrun games=0 migrated=0 sanitized=0";
+
+// Exposed for the harness (`q2bootcfg`) so the migration is assertable from a suite instead
+// of inferred from a settings value that could be right for six other reasons.
+void Q2_iOS_BootConfigReport(char *out, int outsz)
+{
+    if (out && outsz > 0) snprintf(out, (size_t)outsz, "%s", s_bootcfg_report);
+}
+
+// Returns: 0 nothing to do, 1 migrated verbatim, 2 migrated with the .2 signature sanitised.
+- (int)migrateBootConfigForGame:(NSString *)gameDir {
+    NSFileManager *fm = NSFileManager.defaultManager;
+    NSString *root   = [gameDir stringByAppendingPathComponent:@"q2reproconfig.cfg"];
+    NSString *legacy = [gameDir stringByAppendingPathComponent:@"configs/q2reproconfig.cfg"];
+    if ([fm fileExistsAtPath:root]) return 0;          // live config already exists — hands off
+    NSString *text = [NSString stringWithContentsOfFile:legacy encoding:NSUTF8StringEncoding error:NULL];
+    if (!text.length) return 0;
+
+    BOOL clobbered = NO;
+    NSString *out = Q2BootCfgSanitise(text,
+        @"// carried across from configs/q2reproconfig.cfg by the app shell.\n", &clobbered);
+    NSError *err = nil;
+    if (![out writeToFile:root atomically:YES encoding:NSUTF8StringEncoding error:&err]) {
+        NSLog(@"[q2repro] boot config carry-across FAILED for %@: %@", gameDir, err);
+        return 0;
+    }
+    NSLog(@"[q2repro] boot config carried across for %@ (sanitised=%d)", gameDir.lastPathComponent, clobbered);
+    return clobbered ? 2 : 1;
+}
+
+// THE .7 VICTIM (D-VR-R5.1). The dead sanitiser shipped in 1.0.11.7, so a player who first
+// launched .7 already ran the carry-across — the destination file EXISTS, and it holds the
+// .2 damage, carried across verbatim. For them the migration above is over: its marker is
+// the destination, and the destination is there. Fixing the signature alone would heal
+// everyone who has not yet launched .7 and abandon everyone who has.
+//
+// So .8 does a second, separately-stamped one-shot pass over the LIVE config: if it still
+// carries the two-row damage signature, drop those rows in place. Same signature, same
+// helper, same trade — just applied to the file the earlier pass already moved.
+//
+// It needs its OWN marker and cannot reuse "the destination exists" (it always does here).
+// A comment in the config would not survive: the engine rewrites this file from scratch on
+// every writeconfig_boot and keeps no comments, so the marker would vanish and the heal
+// would re-run — which matters, because after healing, a player who deliberately re-chooses
+// shadows-off would have it taken away again on every launch, forever. A stamp file next to
+// the config is durable and is never touched by the engine. It is written whether or not
+// anything was healed, so this is strictly a one-shot per game directory.
+//
+// Returns 1 if damage was actually found and dropped, 0 otherwise.
+- (int)healBootConfigForGame:(NSString *)gameDir {
+    NSFileManager *fm = NSFileManager.defaultManager;
+    NSString *root  = [gameDir stringByAppendingPathComponent:@"q2reproconfig.cfg"];
+    NSString *stamp = [gameDir stringByAppendingPathComponent:@".q2repro-bootcfg-heal"];
+    if ([fm fileExistsAtPath:stamp]) return 0;         // this pass already ran here
+
+    int healed = 0;
+    NSString *text = [NSString stringWithContentsOfFile:root encoding:NSUTF8StringEncoding error:NULL];
+    if (text.length) {
+        BOOL clobbered = NO;
+        NSString *out = Q2BootCfgSanitise(text, nil, &clobbered);
+        if (clobbered) {
+            NSError *err = nil;
+            if ([out writeToFile:root atomically:YES encoding:NSUTF8StringEncoding error:&err]) {
+                healed = 1;
+                NSLog(@"[q2repro] boot config healed in place for %@", gameDir.lastPathComponent);
+            } else {
+                NSLog(@"[q2repro] boot config heal FAILED for %@: %@", gameDir, err);
+                return 0;                              // no stamp — retry on the next launch
+            }
+        }
+    }
+    [@"1" writeToFile:stamp atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+    return healed;
+}
+
+- (void)migrateBootConfigsIn:(NSString *)home {
+    NSFileManager *fm = NSFileManager.defaultManager;
+    int games = 0, migrated = 0, sanitized = 0, healed = 0;
+    // Every game directory under homedir, not just baseq2: a mod switch gives the mod its own
+    // config, and a player who set up a mod has the same right to keep those settings.
+    for (NSString *name in [fm contentsOfDirectoryAtPath:home error:NULL]) {
+        NSString *g = [home stringByAppendingPathComponent:name];
+        BOOL dir = NO;
+        if (![fm fileExistsAtPath:g isDirectory:&dir] || !dir || [name hasPrefix:@"."]) continue;
+        games++;
+        int r = [self migrateBootConfigForGame:g];
+        if (r) migrated++;
+        if (r == 2) sanitized++;
+        // A fresh carry-across has just been sanitised with the current signature, so stamp
+        // it too — the heal below is only ever for configs an EARLIER build moved.
+        healed += [self healBootConfigForGame:g];
+    }
+    snprintf(s_bootcfg_report, sizeof(s_bootcfg_report),
+             "BOOTCFGNOW state=ran games=%d migrated=%d sanitized=%d healed=%d home=%s",
+             games, migrated, sanitized, healed, home.fileSystemRepresentation);
+}
+
 // q2repro:// deep links (Shortcuts / Siri / home-screen). Examples:
 //   q2repro://menu · q2repro://play · q2repro://map/base1 · q2repro://action (launch a mod).
 - (BOOL)application:(UIApplication *)app openURL:(NSURL *)url options:(NSDictionary *)opts {
@@ -1507,6 +1819,10 @@ static NSString *DocsDir(void) {
     // the old in-baseq2 settings across once so nothing is lost.
     NSString *home = vanilla ? base : [self profileDir];
     if (!vanilla) [self migrateSettingsInto:home];
+    // Q-VR7: unify the two config paths BEFORE the engine boots — FS_AddConfigFiles execs the
+    // root config during Qcommon_Init, so a carry-across that ran after it would take effect
+    // one launch late. See -migrateBootConfigsIn: for the .2 sanitiser and why it is there.
+    [self migrateBootConfigsIn:home];
 
     // Install the bundled menus + generate the mods list INTO homedir (must precede engine boot;
     // the UI parses them at init). This has to run AFTER `home` is known — writing them to the
@@ -1553,11 +1869,20 @@ static NSString *DocsDir(void) {
     // gl_modulate(2)×3 = 6× vs the world's 2× — guns/enemies/items blew out while the world
     // looked fine. Reset to default so models match world brightness.
     VID_iOS_Command("set gl_modulate_entities 1");
+    // com_rerelease follows the DATA, and it has to be re-asserted here because it is an
+    // archived cvar and the boot config is exec'd during Qcommon_Init — AFTER the `+set` on
+    // the command line. Before R5 that did not matter, because the config was never read;
+    // now it is, and a player who once had the rerelease set installed and then removed it
+    // would boot with com_rerelease 1 on vanilla data — which is precisely the "am I on
+    // vanilla or rerelease?" confusion the data-derived choice exists to prevent. The shell
+    // knows what is on disk; the config only knows what used to be.
+    VID_iOS_Command(hasRR ? "set com_rerelease 1" : "set com_rerelease 0");
     NSLog(@"[q2repro] engine initialized; starting display link");
 
     self.link = [CADisplayLink displayLinkWithTarget:self selector:@selector(tick)];
     [self applyRefreshRate];
     [self.link addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
+    q2_link_set(self, NO, "engine start");   // [R16] record the reason; the link is already live
 
     CL_Activate(ACT_ACTIVATED);
     if ([NSProcessInfo.processInfo.arguments containsObject:@"-benchmark"]) {
@@ -1598,8 +1923,39 @@ static NSString *DocsDir(void) {
 - (void)pollController {
     static BOOL hadPad = NO;
     static unsigned ensureTick = 0;
+#if defined(Q2_XR_UI) && Q2_XR_UI
+    // THE ONE-FIST TRAP (charter D5 context 3). The SAME `SpatialGamepad` declaration that
+    // makes the Sense pair trackable makes GameController hand each half back as its own
+    // ordinary gamepad — and `firstObject` then drives the entire game from one hand, weapon
+    // wheel and bind table included. So the pad we poll is the first NON-spatial one. The
+    // filter is deliberately conservative (it fires only when a spatial controller carries a
+    // name and no ordinary one does), so its failure mode is the status quo, never a dead pad.
+    // The declaration and this filter ship in the SAME build, always.
+    GCExtendedGamepad *gp = nil;
+    for (GCController *c in GCController.controllers) {
+        const char *nm = (c.vendorName.length ? c.vendorName : @"MFi Gamepad").UTF8String;
+        if (Q2_VR_SenseShouldIgnoreGamepad(nm)) continue;
+        if (c.extendedGamepad) { gp = c.extendedGamepad; break; }
+    }
+    // The Sense pair's own contexts: the menu pump and the flat-mode gamepad merge. Runs
+    // whether or not an ordinary pad is present, and returns immediately while VR gameplay
+    // owns the pair (the engine thread drains the same edge detector there).
+    Q2_VR_HandsUIFrame();
+#else
     GCExtendedGamepad *gp = GCController.controllers.firstObject.extendedGamepad;
-    if (!gp) { hadPad = NO; return; }
+#endif
+    // [R7b item 7] Reconcile the menu pause. BEFORE the `if (!gp) return` below, deliberately:
+    // in a headset there is usually no ordinary gamepad at all, and a reconciliation that only
+    // ran when one was connected would strand a paused game behind a menu the Sense pair
+    // closed. Edge-triggered inside, so this is a cheap read on the poll and a producer item
+    // only on a transition.
+    Q2_iOS_MenuPauseTick();
+    if (!gp) {
+#if defined(Q2_XR_UI) && Q2_XR_UI
+        if (hadPad) Q2_VR_PadClearPad();   // the pad's slot in the merged snapshot, not the hands'
+#endif
+        hadPad = NO; return;
+    }
 
     // Keep the default pad layout applied while a pad is present: on connect, then
     // every ~256 frames — `game` switches re-exec a default.cfg (vanilla ones open
@@ -1612,9 +1968,22 @@ static NSString *DocsDir(void) {
     // double-toggled: opening the menu switched modes mid-hold and the other block's stale flag
     // fired again, flashing the menu open→closed on the first press.
     if (@available(iOS 13.0, *)) {
+        // [R7b items 6+7] ONE Start body, shared with the Sense pair: skip a cinematic if one
+        // is playing, otherwise toggle the menu AND pause a live single-player game. It used
+        // to call VID_iOS_ToggleMenu directly and the world kept running behind the menu.
         static BOOL pmenu = NO; BOOL c = gp.buttonMenu.isPressed;
-        if (c && !pmenu) VID_iOS_ToggleMenu();
+        if (c && !pmenu) VID_iOS_PadStartButton();
         pmenu = c;
+    }
+    // [R7b item 6] The face buttons skip a cinematic too, on this stack as on the Sense pair —
+    // the iPhone has always skipped on a screen tap and a controller player had no way in.
+    if (VID_iOS_PassiveState() == 2 && !VID_iOS_MenuActive()) {
+        static BOOL pskip = NO;
+        BOOL c = gp.buttonA.isPressed || gp.buttonB.isPressed ||
+                 gp.rightTrigger.value > 0.3f || gp.leftTrigger.value > 0.3f;
+        if (c && !pskip) VID_iOS_SkipCinematic();
+        pskip = c;
+        return;                 // a movie takes no gameplay input
     }
 
     // Menu mode: dpad/stick navigate, A selects, B backs.
@@ -1636,14 +2005,23 @@ static NSString *DocsDir(void) {
     // (right_shoulder "+wheel") included — works unmodified and stays rebindable.
     float lx = gp.leftThumbstick.xAxis.value, ly = gp.leftThumbstick.yAxis.value;
     static BOOL moving = NO;
-    if (fabsf(lx) > 0.15f || fabsf(ly) > 0.15f) { CL_SetAnalogMove(ly, lx); moving = YES; }
-    else if (moving) { CL_SetAnalogMove(0, 0); moving = NO; }
+    if (fabsf(lx) > 0.15f || fabsf(ly) > 0.15f) { VID_iOS_AnalogMove(ly, lx); moving = YES; }
+    else if (moving) { VID_iOS_AnalogMove(0, 0); moving = NO; }
 
     float rx = gp.rightThumbstick.xAxis.value, ry = gp.rightThumbstick.yAxis.value;
     float csx = VID_iOS_SensX() / 3.0f, csy = VID_iOS_SensY() / 3.0f;   // neutral 3 = 1.0×
     float iy = VID_iOS_InvertY() ? -1.0f : 1.0f;
     if (fabsf(rx) < 0.12f) rx = 0;   // deadzone
     if (fabsf(ry) < 0.12f) ry = 0;
+#if defined(Q2_XR_UI) && Q2_XR_UI
+    if (Q2_VR_Mode() == 2) {
+        // In VR the right stick does NOT drive the view. The head owns pitch absolutely — a
+        // stick that could also pitch the camera would put the horizon somewhere the player's
+        // neck says it is not — and yaw goes through the snap/smooth turn machinery, which
+        // integrates against the engine's own frame time rather than this timer's.
+        Q2_VR_PadSticks(lx, ly, rx, ry, 0);
+    } else
+#endif
     // rate look each frame (0 when centered); engine scales by turn-speed and routes to
     // the weapon wheel by DIRECTION when it's open (GTA-style select).
     VID_iOS_LookAnalog(rx * csx, iy * ry * csy);
@@ -1668,6 +2046,53 @@ static NSString *DocsDir(void) {
     }
     #undef GK
 }
+
+#if defined(Q2_XR_UI) && Q2_XR_UI
+// ---- the VR pad driver ---------------------------------------------------------------
+// R1 descoped gamepad-in-VR for a specific reason: under `.full` immersion visionOS stops
+// ticking the hidden 2D window's CADisplayLink, and that link is what polled the pad. The
+// polling therefore needs a home that does not depend on a window being rendered.
+//
+// A main-queue timer, and not the engine thread. GameController's controller list is
+// mutated from the main queue (connect/disconnect notifications post there), so polling it
+// from the engine thread would be an unsynchronised read of an array UIKit can replace
+// mid-iteration. A valueChangedHandler would run on the same queue anyway, and a stick held
+// at a constant deflection emits no events at all — so the INTEGRATION (smooth turn, snap
+// hysteresis) would still have to live on the engine frame, where the engine's own dt is.
+// The split is therefore: sample on main at a fixed cadence, integrate on the engine frame.
+// Everything it writes into the engine goes through the producer funnel R1 built for
+// exactly this.
+//
+// `padticks` is a heartbeat, reported in MOVENOW: a simulator run in a real `.full` space
+// can then PROVE that this driver keeps running when the display link does not, which is
+// the entire claim the round rests on.
+static atomic_int q2_vr_pad_ticks;
+int Q2_VR_PadTicks(void) { return atomic_load(&q2_vr_pad_ticks); }
+
+- (void)startVRPadTimer {
+    if (self.vrPadTimer) return;
+    dispatch_source_t t = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
+                                                 dispatch_get_main_queue());
+    // 90 Hz: the headset's own cadence. Sampling slower makes a snap-turn flick missable;
+    // sampling faster buys nothing, because the integration is on the engine frame.
+    dispatch_source_set_timer(t, DISPATCH_TIME_NOW, NSEC_PER_SEC / 90, NSEC_PER_MSEC);
+    __weak typeof(self) weakSelf = self;
+    dispatch_source_set_event_handler(t, ^{
+        atomic_fetch_add(&q2_vr_pad_ticks, 1);
+        [weakSelf pollController];
+    });
+    dispatch_resume(t);
+    self.vrPadTimer = t;
+    Q2_VR_Log("VRPAD main-queue driver started (the display link is paused in VR)");
+}
+
+- (void)stopVRPadTimer {
+    if (!self.vrPadTimer) return;
+    dispatch_source_cancel(self.vrPadTimer);
+    self.vrPadTimer = nil;
+    Q2_VR_Log("VRPAD main-queue driver stopped");
+}
+#endif
 
 - (void)applyRefreshRate {
     if (@available(iOS 15.0, *)) {
@@ -1712,6 +2137,38 @@ static NSString *DocsDir(void) {
     // Before anything that can early-out: the intro cinematic and the attract demo
     // make sound long before there is a live game to gate on.
     Q2_iOS_AudioTick();
+#if defined(Q2_XR_UI) && Q2_XR_UI
+    // [R16] THE MAIN-TICK GUARD. If the VR engine thread is running it owns Qcommon_Frame
+    // and the GL context; a link that got unpaused behind VR's back must not double-drive
+    // the engine from here. Count it, say it once per VR session with the reason the link
+    // was unpaused, and put the link back where entry left it.
+    if (Q2_VR_EngineThreadRunning()) {
+        unsigned n = atomic_fetch_add(&q2_main_ticks_in_vr, 1u) + 1u;
+        if (!atomic_exchange(&q2_maintick_logged, true)) {
+            char line[192];
+            snprintf(line, sizeof line, "MAINTICK in VR: link was unpaused by %s (tick %u) - %s",
+                     Q2_VR_LinkReason(), n,
+#if !defined(Q2_NO_MAINTICK_GUARD) || !Q2_NO_MAINTICK_GUARD
+                     "engine NOT driven from main, link re-paused"
+#else
+                     "GUARD COMPILED OUT - main is about to drive the engine too"
+#endif
+                     );
+            Q2_VR_Log(line);
+        }
+        // What survives the guard, and why nothing else does. Q2_iOS_AudioTick (above) is the
+        // only per-tick call that is safe here: it touches AVAudioSession and the mixer gain
+        // and never the client or a cvar. NOT pollController — the 90 Hz VRPAD timer already
+        // polls the pad in VR, and a second poller would double-count sticks. NOT Q2_VR_Tick —
+        // the VR engine thread calls it itself every frame (q2_vr_glue.m:920), and its yaw
+        // trace / autocapture / map watch read engine state, which is the very thing this
+        // guard exists to keep one thread away from.
+#if !defined(Q2_NO_MAINTICK_GUARD) || !Q2_NO_MAINTICK_GUARD
+        q2_link_set(self, YES, "maintick guard");
+        return;
+#endif
+    }
+#endif
     [self pollController];
     double f0 = self.benchmark ? CACurrentMediaTime() : 0;
 #if defined(Q2_XR_UI) && Q2_XR_UI
@@ -1739,6 +2196,7 @@ static NSString *DocsDir(void) {
     [self.glView updateTouchUI];
     [self driveAttract];
     [self updateFpsOverlay];
+    Q2_VR_Tick();   // black box: ~1 Hz coalesced write (a no-op on every other frame)
     if (self.benchmark) [self recordBenchFrame:(f1 - f0) tick:(CACurrentMediaTime() - t0)];
     if (self.shots > 0) {   // [Phase 2] periodic artifact capture (demo or gameplay, not menu/cin)
         static int fc = 0;
@@ -1818,15 +2276,33 @@ static NSString *DocsDir(void) {
         VID_iOS_Command([pl isEqualToString:@"menu"] ? "pushmenu main" : [NSString stringWithFormat:@"game %@", pl].UTF8String);
     }
     CL_Activate(ACT_ACTIVATED);
+#if defined(Q2_XR_UI) && Q2_XR_UI
+    Q2_VR_SetAppBackgrounded(0);   // [R21] VR-only: the glue that owns this flag is not linked on iOS
+#endif
+    Q2_VR_MarkRunning(1);   // [R14b] foreground again — re-arm the unclean-exit marker
 }
 - (void)applicationWillResignActive:(UIApplication *)app { if (self.engineStarted) CL_Activate(ACT_MINIMIZED); }
 - (void)applicationDidEnterBackground:(UIApplication *)app  {
-    // Persist settings (archived cvars + bindings) — iOS kills backgrounded apps, so
-    // the engine's write-on-quit never runs. Writes q2reproconfig.cfg (read at boot).
-    if (self.engineStarted) VID_iOS_Command("writeconfig q2reproconfig.cfg");
-    self.link.paused = YES;
+    // Persist settings (archived cvars + bindings) — iOS kills backgrounded apps, so the
+    // engine's own write-on-quit (CL_Shutdown → CL_WriteConfig) never runs. `writeconfig_boot`
+    // (overlay 0026) is that same writer on demand, so this writes the file the engine execs
+    // at boot. It used to be `writeconfig q2reproconfig.cfg`, which writes a *named saved
+    // config* under configs/ that nothing has ever exec'd — see Q-VR7.
+    if (self.engineStarted) VID_iOS_Command("writeconfig_boot");
+    // [R14b] A clean background is a clean shutdown as far as iOS is concerned — the system
+    // may kill us from here at any time and that is expected, so disarm rather than cry wolf.
+    Q2_VR_MarkRunning(0);
+#if defined(Q2_XR_UI) && Q2_XR_UI
+    Q2_VR_SetAppBackgrounded(1);   // [R21] the VR pacing repair must not re-activate audio from here
+#endif
+    q2_link_set(self, YES, "didEnterBackground");
 }
-- (void)applicationWillEnterForeground:(UIApplication *)app { self.link.paused = NO; }
+- (void)applicationWillEnterForeground:(UIApplication *)app {
+#if defined(Q2_XR_UI) && Q2_XR_UI
+    Q2_VR_SetAppBackgrounded(0);   // [R21]
+#endif
+    q2_link_set(self, NO, "willEnterForeground");
+}
 
 @end
 
@@ -1883,20 +2359,98 @@ void Q2_XR3_ScenePhase(int active) {
     AppDelegate *app = Q2_SharedController();
     if (!app.engineStarted) return;
     if (active) {
-        app.link.paused = NO;
+        q2_link_set(app, NO, "scenephase active");
         CL_Activate(ACT_ACTIVATED);       // → S_Activate → session setActive + AudioOutputUnitStart
+        Q2_VR_MarkRunning(1);             // [R14b] re-arm the unclean-exit marker
     } else {
-        VID_iOS_Command("writeconfig q2reproconfig.cfg");   // iOS/visionOS kill backgrounded apps
+        VID_iOS_Command("writeconfig_boot");   // iOS/visionOS kill backgrounded apps
+        Q2_VR_MarkRunning(0);             // [R14b] a clean background disarms it
         CL_Activate(ACT_MINIMIZED);
-        app.link.paused = YES;
+        q2_link_set(app, YES, "scenephase background");
     }
 }
 
 // 3D entry/exit, called from the SwiftUI shell AROUND openImmersiveSpace/dismiss.
 // Order is load-bearing (vkQuake): the engine must stop touching the window surface
 // BEFORE the space opens, and only return to it AFTER the space is dismissed.
-void Q2_XR3_EngineEnter3D(void) { VID_iOS_XR3_SetMode(1); }
-void Q2_XR3_EngineExit3D(void)  { VID_iOS_XR3_SetMode(0); }
+void Q2_XR3_EngineEnter3D(void) { VID_iOS_XR3_SetMode(1); Q2_VR_SetMode(1); }
+void Q2_XR3_EngineExit3D(void)  { VID_iOS_XR3_SetMode(0); Q2_VR_SetMode(0); }
+
+// ---- VR entry/exit ------------------------------------------------------------------
+// Frame ownership moves BEFORE the space opens. Under .full immersion visionOS stops
+// ticking the hidden 2D window's display link, so an engine still driven by that link
+// freezes on the entry frame: the 2D window stops, VR shows one frame forever, and audio
+// keeps playing because nothing pumps the mixer. Pausing the link is therefore not an
+// optimisation, it is the acknowledgement that the system has already stopped it.
+//
+// Everything here runs on the main thread while main still owns the ANGLE context; the
+// context handover is the last step, inside Q2_VR_StartEngineThread.
+void Q2_XR3_EngineEnterVR(void)
+{
+    AppDelegate *app = Q2_SharedController();
+    Q2_VR_ResetMainTicksInVR();          // [R16] the counter is per VR SESSION
+    q2_link_set(app, YES, "enter VR");
+    // MSAA off and the render scale fixed for the duration: a multisampled or rescaled
+    // depth buffer is not a valid single-sample depth snapshot, and the compositor
+    // reprojects against exactly that snapshot. gl_multisamples already defaults to 0 —
+    // this is the assertion, not the change.
+    // Every archived cvar VR takes away from the player goes through the STASH, not through
+    // a bare `set`: gl_shadows is CVAR_ARCHIVE, and a crash or a swipe-kill inside VR would
+    // otherwise write "shadows off" into their config permanently, with no way for them to
+    // know why. The stash is the list; msaa off, viewsize 100 and prediction on are in it.
+    Q2_VR_StashCvars();
+    VID_iOS_XR3_SetVRDepth(1);          // per-eye Depth32Float instead of the shared RB
+    VID_iOS_XR3_SetUIRedirect(1);       // HUD/menus/console onto their own texture (D6)
+    VID_iOS_XR3_SetMode(1);             // engine renders the eye FBOs, not the window
+    Q2_VR_SetMode(2);
+    // A touch in flight when the space opened would otherwise stay latched forever: the
+    // window is parked and curtained, so no touchesEnded is ever coming for it.
+    VID_iOS_AnalogMove(0, 0);
+    VID_iOS_LookAnalog(0, 0);
+    Q2_VR_PadClear();
+    Q2_VR_StartEngineThread();
+    [app startVRPadTimer];
+}
+
+int  Q2_XR3_EngineVRStopRequest(void) { Q2_VR_RequestEngineStop(); return 1; }
+int  Q2_XR3_EngineVRStopped(void)     { return !Q2_VR_EngineThreadRunning(); }
+
+// Idempotent and unconditional. It is called from the ordinary exit, from the rollback of
+// a failed entry, and from the Digital Crown belt — a finalize that only runs on a state
+// TRANSITION does not run on the path that needs it most.
+void Q2_XR3_EngineExitVR(void)
+{
+    [Q2_SharedController() stopVRPadTimer];
+    Q2_VR_FinishEngineStop();           // context back to main, funnel off, queue drained
+    VID_iOS_XR3_SetVRDepth(0);
+    VID_iOS_XR3_SetUIRedirect(0);
+    VID_iOS_XR3_SetMode(0);
+    Q2_VR_SetMode(0);
+    // The player gets their cvars back. Idempotent and unconditional, like the rest of this
+    // finalize: it is also called from a failed entry's rollback and from the Crown belt, and
+    // a restore that only ran on a clean exit would not run on the path that needs it.
+    Q2_VR_RestoreCvars();
+    Q2_VR_PadClear();
+    // Last: hand the frame back to main. Normally the engine thread has already stopped
+    // (Q2_VR_FinishEngineStop above) and the funnel allows this. But the Swift side's thread
+    // stop is a BOUNDED 2 s poll that finalizes anyway on timeout — and then the funnel would
+    // REFUSE this unpause, leaving the link paused forever with nothing left to unpause it: a
+    // 2D app frozen after Exit VR (R16 review finding). So this one site bypasses the refusal.
+    // It is still safe: `tick`'s own guard keeps refusing to DRIVE the engine while the thread
+    // runs, so a late thread cannot be double-driven — and the moment it exits, the ticking
+    // link resumes the 2D app on its own instead of never.
+    {
+        AppDelegate *app = Q2_SharedController();
+        const int late = Q2_VR_EngineThreadRunning();
+        if (late) q2_link_log(app, "LINK exit VR finalize with the VR engine thread STILL RUNNING - forcing the unpause; tick stays guarded until it exits");
+        atomic_store(&q2_link_reason, "exit VR finalize");
+        if (app.link) {
+            app.link.paused = NO;
+            q2_link_log(app, late ? "LINK paused=0 reason=exit VR finalize (forced)"
+                                  : "LINK paused=0 reason=exit VR finalize");
+        }
+    }
+}
 
 // The GAME window's size — never UIApplication.keyWindow. Tapping the ornament pill
 // ("3D"/gear) makes the pill's ~182x68 host window KEY at exactly the moment the entry
@@ -1914,7 +2468,12 @@ CGSize Q2_XR3_GameWindowSize(void) {
 void Q2_XR3_Log(const char *msg) {
     AppDelegate *app = Q2_SharedController();
     if (!app.engineStarted) { NSLog(@"[q2repro] %s", msg); return; }
-    VID_iOS_Command([NSString stringWithFormat:@"echo %s", msg].UTF8String);
+    // NOT the `echo` command any more: its parser splits on ';' and breaks on '"', which
+    // made those two characters unusable in every diagnostic line the shell emits. Q2_VR_Log
+    // goes to Com_Printf directly (so console.log and the tcp/8770 bridge both carry it) and
+    // to the black box's rolling tail, sanitising as it goes.
+    extern void Q2_VR_Log(const char *msg);
+    Q2_VR_Log(msg);
 }
 #else
 int main(int argc, char *argv[]) {

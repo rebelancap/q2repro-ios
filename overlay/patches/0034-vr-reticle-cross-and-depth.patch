@@ -1,0 +1,303 @@
+[vr overlay R9] The reticle, remade: Quake II's own four-stroke cross, at a fixed
+angular size, traced from the HEAD so it finally has stereo depth.
+
+Reported in the headset on 1.0.11.11: "it renders, but it's too big and doesn't look
+native — it should look like the standard Quake 2 crosshair: just four lines
+pointing toward each other. It has no depth to it like it does in the other Quake
+ports — it's fixed on screen as if it's 2D, though it DOES move where I'm aiming.
+And it gets VERY large when I come close to a wall; it should not change size at
+all. If unsure about the size, give me a slider."
+
+Three faults, one of which is a genuine mechanism and two of which are constants.
+
+  1. THE "NO DEPTH" BUG WAS THE TRACE ORIGIN. CL_VR_AddAimDot runs inside view.c's
+     PER-EYE VR block, where cl.refdef.vieworg is already this eye's origin. It
+     traced from there along a ray whose direction is shared by both eyes, so the
+     hit point came out at eye_origin + f*range — a CONSTANT offset from whichever
+     eye was rendering. Both eyes projected the mark to the same screen position;
+     the binocular disparity was exactly zero; a zero-disparity mark fuses at
+     infinity. That is precisely "fixed on screen as if it's 2D, though it DOES
+     move where I'm aiming". The trace now starts at the CYCLOPEAN head origin,
+     recovered by subtracting this eye's own `eyeofs` back out of vieworg in the
+     same basis view.c added it in, so the two eyes trace one identical ray onto
+     one identical world point.
+  2. IT BALLOONED NEAR A WALL because every dimension had a WORLD-unit floor:
+     standoff clamp(range*0.03, 6, 64), half max(0.6, ...), spread max(2, ...).
+     A fixed world size subtends a growing angle as you approach it, so under
+     ~75 units the mark stopped being angular; the 6-unit standoff floor made it
+     worse by dragging the mark 30% of the way back to the eye at 20 units of
+     range. All three clamps are gone: every term is now range x constant.
+  3. THE SHAPE IS THE ENGINE'S GLYPH. Four thin strokes pointing inward with a
+     central gap — gap 0.25, stroke 0.75, thickness 0.25, all as fractions of the
+     half-width — drawn dark-then-white so the mark reads on a bright wall too,
+     billboarded on the EYE's view axes so up stays up. Default total width 1.2
+     degrees, which is what the reference screenshot subtends, and the new
+     "Crosshair Size" row (0.5x ... 3.0x) is the slider he asked for.
+
+--- a/src/client/entities.c
++++ b/src/client/entities.c
+@@ -1564,12 +1564,13 @@
+ // parallax is a documented, accepted limitation of not moving the player edict server-side
+ // (charter §1 OUT), and the honest thing is to show the same ray the server will trace.
+ #define VR_DOT_RANGE 8192.0f
++// [vr overlay R9] tan(0.6 deg): the reticle is 1.2 degrees wide, at every range.
++#define VR_DOT_HALFTAN 0.0104724f
+ void CL_VR_AddAimDot(void)
+ {
+     trace_t tr;
+     vec3_t start, end, f, r, u, mins, maxs, base;
+-    float standoff, spread, half, scale;
+-    int i;
++    float standoff, half, scale, draw_range;
+ 
+     q2vr.dot_drawn = 0;
+     q2vr.dot_range = 0.0f;
+@@ -1596,7 +1597,34 @@
+         ray[ROLL]  = 0.0f;
+         AngleVectors(ray, f, r, u);
+     }
++
++    // [vr overlay R9] THE TRACE STARTS AT THE HEAD, NOT AT THIS EYE, and that is the whole of
++    // the reported "it has no depth to it, it's fixed on screen as if it's 2D".
++    //
++    // This function runs INSIDE view.c's per-eye VR block, so `cl.refdef.vieworg` is already
++    // this eye's origin. Tracing from it along a shared direction put the hit point at
++    // eye_origin + f * range — a CONSTANT offset from whichever eye was rendering. Both eyes
++    // therefore projected the mark to the same screen position, the binocular disparity was
++    // exactly zero, and a zero-disparity mark fuses at infinity: a head-locked 2D overlay
++    // that still swings with the aim ray. Every other symptom in the report follows from it,
++    // because a mark at infinity cannot be occluded, cannot converge, and cannot be judged
++    // for distance.
++    //
++    // The fix is to trace from the CYCLOPEAN head origin, which is this eye's origin with its
++    // own head-local offset taken back out — `eyeofs` is exactly that offset (the shell writes
++    // it out of the drawable's deviceFromEye) rotated by the finished view angles, which is
++    // what the block above added. Undoing it here reproduces the head point bit-for-bit
++    // rather than re-deriving it, so both eyes trace the identical ray, land on the identical
++    // world point, and the mark acquires the disparity its distance earns.
+     VectorCopy(cl.refdef.vieworg, start);
++    {
++        vec3_t vf, vr, vu;
++        AngleVectors(cl.refdef.viewangles, vf, vr, vu);
++        VectorMA(start, -q2vr.eyeofs[0], vf, start);
++        VectorMA(start, -q2vr.eyeofs[1], vr, start);
++        VectorMA(start, -q2vr.eyeofs[2], vu, start);
++    }
++
+     VectorMA(start, VR_DOT_RANGE, f, end);
+     VectorSet(mins, 0, 0, 0);
+     VectorSet(maxs, 0, 0, 0);
+@@ -1605,38 +1633,40 @@
+         return;
+ 
+     q2vr.dot_range = VR_DOT_RANGE * tr.fraction;
+-    // [vr overlay R8] THE STANDOFF. The refresh draws the reticle with the depth test off, so
+-    // this is no longer what keeps it out of the wall — it is what keeps it at the right
+-    // STEREO depth: the two eyes converge on where these points are, and a point exactly on
+-    // the surface fights the surface's own texels for the same disparity. Clamped at both
+-    // ends: a floor so the near field clears, a ceiling so a 4000-unit sky shot does not park
+-    // the mark 120 units in front of the thing it is marking.
+-    standoff = Q_clipf(q2vr.dot_range * 0.03f, 6.0f, 64.0f);
++
++    // [vr overlay R9] NO FLOOR AND NO CEILING ON ANYTHING HERE, which is the other half of the
++    // fourth verdict: "it gets VERY large when I come close to a wall; it should not change
++    // size at all."
++    //
++    // R8 clamped all three terms — standoff clamp(range*0.03, 6, 64), half max(0.6, ...),
++    // spread max(2.0, ...). Every clamp is a WORLD size, and a fixed world size subtends a
++    // growing angle as you approach it, so below about 75 units of range the mark stopped
++    // being angular and started ballooning; the 6-unit standoff floor made it worse by
++    // dragging the mark a large fraction of the way back towards the eye (at 20 units of
++    // range it sat 30% closer than the thing it marked). Both are gone. Every dimension is
++    // now range x constant, so the reticle subtends the SAME angle at 20 units and at 4000,
++    // which is what a crosshair is.
++    standoff = q2vr.dot_range * 0.01f;
+     VectorMA(tr.endpos, -standoff, f, base);
++    draw_range = q2vr.dot_range - standoff;
+ 
+-    // ANGULAR sizes, converted to world units at the hit range, so the reticle subtends the
+-    // same amount of the player's view at one metre and at fifty. 0.0080 rad half-angle is a
+-    // 0.92-degree centre mark; the satellites are half that, 2.2 degrees out along the RAY's
+-    // own right/up (not the view's), so the figure stays square to where the hand points
+-    // rather than shearing as the head rolls.
+-    scale = q2vr.aim_dot_scale > 0.01f ? q2vr.aim_dot_scale : 1.0f;
+-    half = max(0.6f, q2vr.dot_range * 0.0080f * scale);
+-    spread = max(2.0f, q2vr.dot_range * 0.0190f * scale);
++    // The angular half-width. VR_DOT_HALFTAN is tan(0.6 deg), so the finished cross is 1.2
++    // degrees across at row 1.0 — the angle the reference screenshot subtends (a
++    // ~24 px mark across a 1920 px, 90-degree image). The row multiplies it: "Crosshair Size"
++    // in the VR settings, 0.5x ... 3.0x, which is the slider he asked for.
++    scale = q2vr.aim_dot_scale > 0.01f ? q2vr.aim_dot_scale : 1.0f;
++    half = draw_range * VR_DOT_HALFTAN * scale;
+ 
++    // ONE POINT AND ONE HALF-WIDTH, not five quads. The five-square figure was legible but it
++    // is not what Quake II draws, and the verdict is that the crosshair should be the
++    // engine's own glyph: four thin strokes pointing inward with a gap at the centre. Only the
++    // refresh knows this eye's view axes, so it builds the four strokes from these two numbers
++    // (GL_DrawVRReticle, tess.c) and the proportions live there, in one place.
+     VectorCopy(base, q2vr.dot_pts[0]);
+     q2vr.dot_half[0] = half;
+-    for (i = 0; i < 4; i++) {
+-        const float sx = (i == 0) ? 1.0f : (i == 1) ? -1.0f : 0.0f;
+-        const float sy = (i == 2) ? 1.0f : (i == 3) ? -1.0f : 0.0f;
+-        VectorCopy(base, q2vr.dot_pts[i + 1]);
+-        VectorMA(q2vr.dot_pts[i + 1], spread * sx, r, q2vr.dot_pts[i + 1]);
+-        VectorMA(q2vr.dot_pts[i + 1], spread * sy, u, q2vr.dot_pts[i + 1]);
+-        q2vr.dot_half[i + 1] = half * 0.5f;
+-    }
+-    q2vr.dot_npts = 5;
++    q2vr.dot_npts = 1;
+     q2vr.dot_drawn = 1;
+ }
+-
+ #define VR_RISE_SPEED   40.0f       // units per second, upward only
+ float CL_VR_ClampRise(const vec3_t org, float want)
+ {
+--- a/src/refresh/tess.c
++++ b/src/refresh/tess.c
+@@ -152,13 +152,51 @@
+ // but under nothing that matters.
+ void GL_DrawVRReticle(void)
+ {
++    // [vr overlay R9] THE SHAPE IS QUAKE II'S OWN CROSSHAIR: four thin strokes pointing
++    // inward with a gap at the centre, not R8's five squares. The fourth verdict, with a
++    // reference screenshot: "it should look like the standard Quake 2 crosshair: just four
++    // lines pointing toward each other."
++    //
++    // The proportions are read off that screenshot and are all fractions of ONE number, the
++    // half-width the client publishes in dot_half[0]:
++    //     gap        = 0.25 x half   (the clear space either side of centre)
++    //     stroke len = 0.75 x half   (three times the gap, as in the reference)
++    //     thickness  = 0.25 x half   (one third of the stroke's length)
++    // so the finished cross is 2 x half across and every part of it scales together. The
++    // client sends an ANGULAR half-width already converted to world units at the hit range
++    // (entities.c), so nothing here needs to know the distance.
++    //
++    // TWO PASSES, dark then white. The reference glyph carries a one-pixel dark outline and
++    // it is what makes a white mark legible against a bright wall as well as a dark one; here
++    // it is the same four strokes grown by 4.5% of the half-width and drawn black first. Eight
++    // quads, 48 vertices, one draw call — cheap enough not to think about again.
++    //
++    // BILLBOARDED ON THE EYE'S OWN AXES (glr.viewaxis), not on the hand ray: the strokes must
++    // stay square to the screen — up is up — while the mark's POSITION comes from the trace.
++    // That split is what makes it a world object that reads like a crosshair.
++    //
++    // Depth test still off, for R8's reason: a crosshair hidden behind the player's own gun
++    // barrel is not doing its job. The stereo cue is unaffected, because it comes from where
++    // the point IS — and as of R9 that point is traced from the head rather than from this
++    // eye, so the two eyes finally disagree about where it projects, which is the entire
++    // reason it now has depth (entities.c has the mechanism).
+     vec_t *dst;
+     color_t color;
+-    int numverts, i;
++    int numverts, pass, i, k;
++    const vec_t *o;
++    float h, gap, tip, thick;
+ 
+     if (!q2vr.active || !q2vr.dot_drawn || q2vr.dot_npts <= 0)
+         return;
+ 
++    o = q2vr.dot_pts[0];
++    h = q2vr.dot_half[0];
++    if (h <= 0.0f)
++        return;
++    gap   = h * 0.25f;
++    tip   = h;
++    thick = h * 0.125f;     // HALF the stroke width
++
+     GL_LoadMatrix(gl_identity, glr.viewmatrix);
+     GL_LoadUniforms();
+     GL_BindArrays(VA_EFFECT);
+@@ -166,40 +204,54 @@
+     GL_StateBits(GLS_BLEND_BLEND | GLS_DEPTHMASK_FALSE | GLS_DEPTHTEST_DISABLE);
+     GL_ArrayBits(GLA_VERTEX | GLA_TC | GLA_COLOR);
+ 
+-    color.u8[0] = 255;
+-    color.u8[1] = 240;
+-    color.u8[2] = 205;
+-    color.u8[3] = 255;
+-
+     dst = tess.vertices;
+     numverts = 0;
+-    for (i = 0; i < q2vr.dot_npts && i < 5; i++) {
+-        vec3_t a, b, c, d, ro, uo;
+-        int k;
+-        const vec_t *o = q2vr.dot_pts[i];
+-        float h = q2vr.dot_half[i];
+-
+-        if (h <= 0.0f)
+-            continue;
+-        if (numverts + 6 > TESS_MAX_VERTICES)
+-            break;
++    for (pass = 0; pass < 2; pass++) {
++        const float pad = pass ? 0.0f : h * 0.045f;
++        if (pass) {
++            color.u8[0] = 255; color.u8[1] = 255; color.u8[2] = 255; color.u8[3] = 255;
++        } else {
++            color.u8[0] = 0;   color.u8[1] = 0;   color.u8[2] = 0;   color.u8[3] = 200;
++        }
++        for (i = 0; i < 4; i++) {
++            // Stroke 0/1 run right/left, 2/3 up/down. `along` is the stroke's own direction
++            // and `across` its thickness, both taken from this eye's view axes.
++            const float sx = (i == 0) ? 1.0f : (i == 1) ? -1.0f : 0.0f;
++            const float sy = (i == 2) ? 1.0f : (i == 3) ? -1.0f : 0.0f;
++            const float a0 = gap - pad, a1 = tip + pad, w = thick + pad;
++            vec3_t along, across, q[4];
+ 
+-        VectorScale(glr.viewaxis[1], h, ro);
+-        VectorScale(glr.viewaxis[2], h, uo);
+-        VectorSubtract(o, ro, a); VectorSubtract(a, uo, a);   // -r -u
+-        VectorAdd(o, ro, b);      VectorSubtract(b, uo, b);   // +r -u
+-        VectorAdd(o, ro, c);      VectorAdd(c, uo, c);        // +r +u
+-        VectorSubtract(o, ro, d); VectorAdd(d, uo, d);        // -r +u
++            if (numverts + 6 > TESS_MAX_VERTICES)
++                break;
++            if (a1 <= a0)
++                continue;
+ 
+-        {
+-            const vec_t *quad[6] = { a, b, c, a, c, d };
+-            for (k = 0; k < 6; k++) {
+-                VectorCopy(quad[k], dst);
+-                dst[3] = 0;
+-                dst[4] = 0;
+-                WN32(dst + 5, color.u32);
+-                dst += 6;
+-                numverts++;
++            // `across` is `along` TURNED A QUARTER TURN THE SAME WAY EVERY TIME, and that
++            // sign is load-bearing: the effect pipeline culls back faces, so building the
++            // thickness axis as (sy, sx) instead of (-sy, sx) reverses the winding of the two
++            // VERTICAL strokes and the first build of this drew a pair of dashes with no
++            // upright at all. Measured, not reasoned about: the eye image came back with a
++            // 61x8 bright box where a 61x61 cross belonged.
++            VectorScale(glr.viewaxis[1], sx, along);
++            VectorMA(along, sy, glr.viewaxis[2], along);
++            VectorScale(glr.viewaxis[1], -sy, across);
++            VectorMA(across, sx, glr.viewaxis[2], across);
++
++            VectorMA(o,    a0, along, q[0]); VectorMA(q[0], -w, across, q[0]);
++            VectorMA(o,    a1, along, q[1]); VectorMA(q[1], -w, across, q[1]);
++            VectorMA(o,    a1, along, q[2]); VectorMA(q[2],  w, across, q[2]);
++            VectorMA(o,    a0, along, q[3]); VectorMA(q[3],  w, across, q[3]);
++
++            {
++                const vec_t *quad[6] = { q[0], q[1], q[2], q[0], q[2], q[3] };
++                for (k = 0; k < 6; k++) {
++                    VectorCopy(quad[k], dst);
++                    dst[3] = 0;
++                    dst[4] = 0;
++                    WN32(dst + 5, color.u32);
++                    dst += 6;
++                    numverts++;
++                }
+             }
+         }
+     }
+@@ -211,7 +263,6 @@
+     qglDrawArrays(GL_TRIANGLES, 0, numverts);
+     GL_UnlockArrays();
+ }
+-
+ static void GL_FlushBeamSegments(void)
+ {
+     if (!tess.numindices)

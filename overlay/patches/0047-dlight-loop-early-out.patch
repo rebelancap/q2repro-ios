@@ -1,0 +1,306 @@
+Subject: [overlay 0047] gl_dlight_loop — a per-light early-out in the dynamic-light loop,
+         switchable live, default OFF
+
+Measured on the test Vision Pro (2026-09-06, VR Render Quality 1.75 => 3360x3192 per eye,
+120 Hz layer). The engine's GPU time per published frame, `VRGPU eng_ms` p50/p95:
+
+    baseline                      ~15 / 17-22 ms
+    cl_shadowlights 0              4.9 / 7.3 ms
+    gl_per_pixel_lighting 0        3.8 / 6.7 ms
+    vr_sharpen 0 (CAS off)         no change
+
+So roughly two thirds of the engine's GPU time is the per-pixel dynamic-light shading, and
+this is the loop that does it. What that loop does not do is reject a light before shading
+it. The distance test is arithmetic, not a branch:
+
+    float len = max(radius - dist - DLIGHT_CUTOFF, 0.0) / radius;
+
+`len` is zero for every pixel outside the light's radius, and the body still runs in full for
+those pixels: a length(), two dot products, the cone math, the colour multiply. A light four
+thousand units away costs exactly what a light touching the surface costs.
+
+That would be a small waste if the shipped light set were the lights that actually reach the
+pixel. It is not. Under the default `gl_dlight_batchkey 0` a batch's light set is the UNION
+over every face that shares texture and state (tess.c ~925), so a batch routinely carries a
+double-digit light count while any one pixel is inside the radius of two or three of them.
+base1 defines 37 shadow lights; the pose this patch was verified at ships 21 of them into the
+batch UBOs (`DRAWDIAG ... ubits=0000001f0000ffff`). At 10.7 MP per eye, twice per frame, the
+lights the pixel is nowhere near are most of the bill.
+
+`gl_dlight_loop` selects how the loop rejects:
+
+  0  upstream, byte for byte. THE DEFAULT, and it stays the default until the headset
+     A/B says otherwise — the charter's rule is measure before optimizing, and the Mac cannot
+     measure this (see below).
+  1  after `dist` is computed: `if (dist >= dlights[i].radius) continue;`
+     Exactly the condition under which `len` is 0 (`radius` in the shader is the light's
+     radius PLUS DLIGHT_CUTOFF, so `radius - dist - CUTOFF > 0` reduces to
+     `dist < dlights[i].radius`). Skips the lambert, the cone and the colour multiply.
+  2  before the `length()`: `if (dot(d,d) >= r*r) continue;`. Same condition, and it also
+     skips the square root.
+  3  a control that is WRONG ON PURPOSE — it rejects at half the radius. 1 and 2 cannot
+     change a pixel by construction, so "the picture did not change" is equally consistent
+     with "the early-out is exact" and with "the uniform never reached the shader and mode 0
+     ran the whole time". Mode 3 is unmistakable on screen, so switching to it and back is a
+     one-command proof that the branch is live, in the simulator and in the headset alike.
+     Never a shipping value.
+
+PRECISION, because mode 2 squares things and the fragment shader is `precision mediump
+float` (shader.c ~line 67). On ANGLE-Metal mediump is half: max 65504. A squared distance
+across a map (8192^2 = 6.7e7) blows through that, and so does a large light's radius squared
+(1000^2 = 1e6). Two infinities compared against each other would decide the branch by
+accident rather than by geometry, so the squared compare in mode 2 is declared `highp`
+explicitly. Precision qualifiers are accepted (and ignored) by desktop GLSL 1.30+, so the
+same source compiles for the macOS oracle. Modes 0 and 1 are untouched by any of this.
+
+WHY IT IS A UNIFORM AND NOT A #define. The entire point is that it can be toggled in the
+headset, mid-session, over the dev console and read `q2vrpace` — an A/B that needs a shader
+recompile or a vid_restart is an A/B that will not get run. So the loop is emitted once per mode
+with the mode branch OUTSIDE it, selected by `u_dlight_loop`, which rides a former `pad` slot
+in the existing Uniforms block: no new buffer, no new upload, and the std140 layout is
+unchanged (a `float pad_5` became a `float u_dlight_loop`; its C mirror `GLfloat pad` became
+`GLfloat dlight_loop`). It is written in shader_setup_3d alongside u_time and u_modulate.
+Mode 0 therefore runs upstream's loop with nothing whatsoever added inside it, and the branch
+that selects it is uniform-valued — fully coherent across every quad on any GPU that matters.
+The four copies are why MAX_SHADER_CHARS goes from 4096 to 12288; the emitter Q_asserts on
+overflow, so that has to lead the change rather than follow it.
+
+VERIFIED, on the Apple Vision Pro simulator, base1, rerelease data, 1920x1824 per eye, one
+pinned pose with 21 shadow lights in the batch set, the world PAUSED so the comparison has a
+zero noise floor (unpaused, two mode-0 captures already differ on 7.7 % of pixels). Same eye,
+across modes, 3502080 pixels, no tolerance — a pixel counts as differing if any channel
+differs by one:
+
+    mode 0 vs mode 0 (x4)   0 differing pixels
+    mode 0 vs mode 1        0 differing pixels
+    mode 0 vs mode 2        0 differing pixels
+    mode 1 vs mode 2        0 differing pixels
+    mode 0 vs mode 3        2582436 pixels (73.7 %), max abs 129   <- the switch is live
+    mode 0 vs ppl off       2724599 pixels (77.8 %), max abs 240   <- the frame is lit
+
+Full method and artifacts: artifacts/vr-r22/VERIFY-dlight-loop.md.
+
+NO PERFORMANCE NUMBER IS CLAIMED HERE. The Mac's GPU renders this scene with eng_ms p95 under
+0.4 ms; it cannot resolve the gain, and a number from it would be a fiction. The measurement
+happens in the headset, with `gl_dlight_loop 0|1|2` and `q2vrpace`, and the default only
+moves after it.
+
+Apply: patch -p1 -d vendor/q2repro < this
+--- a/src/refresh/gl.h
++++ b/src/refresh/gl.h
+@@ -306,6 +306,9 @@
+ extern cvar_t *gl_lightdiag;
+ extern cvar_t *gl_batchshots;   // [vr overlay 0044 — R20 diagnostic] PPLBATCH one-shot
+ extern cvar_t *gl_dlight_batchkey;  // [vr overlay 0045]
++// [vr overlay 0047] per-light early-out mode in the fragment shader's dlight loop:
++// 0 upstream, 1 reject after the length(), 2 reject before it, 3 a wrong-on-purpose control.
++extern cvar_t *gl_dlight_loop;
+ // [vr overlay 0045] how the two per-batch UBOs are updated: 0 partial glBufferSubData (as
+ // upstream), 1 orphan-then-upload, 2 ring of UBO_RING_SIZE buffers, 3 glFinish after upload.
+ extern cvar_t *gl_dlight_ubo;
+@@ -771,7 +774,7 @@
+     vec4_t      heightfog_end;
+     GLfloat     heightfog_density;
+     GLfloat     heightfog_falloff;
+-    GLfloat     pad;
++    GLfloat     dlight_loop;    // [vr overlay 0047] was pad; std140 layout unchanged
+     GLfloat     pad2;
+     vec4_t      vieworg;
+ } glUniformBlock_t;
+--- a/src/refresh/main.c
++++ b/src/refresh/main.c
+@@ -93,6 +93,7 @@
+ //   2  RING: UBO_RING_SIZE distinct buffer objects, one upload each, rebound with
+ //      glBindBufferBase — no buffer is ever written twice within a ring's worth of draws
+ //   3  FINISH: glFinish() after each upload — decisive, and far too slow to ship
++cvar_t *gl_dlight_loop;     // [vr overlay 0047]
+ cvar_t *gl_dlight_ubo;
+ cvar_t *gl_ublock_ubo;
+ cvar_t *gl_dlight_falloff;
+@@ -1372,6 +1373,13 @@
+     // The uniform block is left on upstream's update (0): all three modes were measured on
+     // it too and NONE changed the picture, so the shipped path there is untouched.
+     gl_dlight_ubo = Cvar_Get("gl_dlight_ubo", "1", 0);
++    // [vr overlay 0047] DEFAULT 0 = upstream's loop, byte for byte. 1 and 2 add a per-light
++    // distance rejection whose output is identical; the charter says measure before
++    // optimizing, so the default only moves after the headset A/B (VRGPU eng_ms).
++    // Live: the mode is a uniform, so no vid_restart and no shader recompile.
++    // 3 is a deliberately-wrong control (rejects at half the radius) whose only job is to
++    // prove, on screen, that the switch is live — see write_dlight_loop(). Never ship it.
++    gl_dlight_loop = Cvar_Get("gl_dlight_loop", "0", 0);
+     gl_ublock_ubo = Cvar_Get("gl_ublock_ubo", "0", 0);
+     gl_dynamic->changed = gl_lightmap_changed;
+     gl_dlight_falloff = Cvar_Get("gl_dlight_falloff", "1", 0);
+--- a/src/refresh/shader.c
++++ b/src/refresh/shader.c
+@@ -19,7 +19,11 @@
+ #include "gl.h"
+ #include "common/sizebuf.h"
+ 
+-#define MAX_SHADER_CHARS    4096
++// [vr overlay 0047] 12288, was 4096. write_dynamic_lights() now emits the per-light loop
++// four times (one per gl_dlight_loop mode) so the mode can be switched by a uniform without
++// a recompile; the dlight fragment shader grows by ~2 KB and 4096 no longer fits it.
++// SZ_Write/shader_printf Q_assert on overflow, so this must lead the change.
++#define MAX_SHADER_CHARS    12288
+ 
+ #define GLSL(x)     SZ_Write(buf, CONST_STR_LEN(#x "\n"));
+ #define GLSF(x)     SZ_Write(buf, CONST_STR_LEN(x))
+@@ -115,7 +119,7 @@
+         vec4 u_heightfog_end;
+         float u_heightfog_density;
+         float u_heightfog_falloff;
+-        float pad_5;
++        float u_dlight_loop;
+         float pad_4;
+         vec4 u_vieworg;
+     )
+@@ -146,43 +150,107 @@
+     GLSF("};\n");
+ }
+ 
+-static void write_dynamic_lights(sizebuf_t *buf)
++// [vr overlay 0047] One emission of upstream's per-light loop body, at one of the three
++// gl_dlight_loop modes. mode 0 is upstream verbatim; 1 and 2 add a distance rejection that
++// is mathematically a no-op on the output (see the patch header) but skips the rest of the
++// body for lights the pixel is outside the radius of.
++static void write_dlight_loop(sizebuf_t *buf, int mode)
+ {
+-    GLSL(vec3 calc_dynamic_lights() {
+-        vec3 shade = vec3(0);
++    GLSF("for (int i = 0; i < num_dlights; i++) {\n");
++    GLSL(
++        vec3 light_pos = dlights[i].position;
++        float light_cone = dlights[i].cone.w;
++    )
++    GLSL(
++        if (light_cone == 0.0)
++            light_pos += v_norm * 16.0;
++    )
++    GLSL(vec3 light_dir = light_pos - v_world_pos;)
+ 
+-        for (int i = 0; i < num_dlights; i++) {
+-            vec3 light_pos = dlights[i].position;
+-            float light_cone = dlights[i].cone.w;
+-
+-            if (light_cone == 0.0)
+-                light_pos += v_norm * 16.0;
+-
+-            vec3 light_dir   = light_pos - v_world_pos;
+-            float dist       = length(light_dir);
+-            float radius     = dlights[i].radius + DLIGHT_CUTOFF;
+-            float len        = max(radius - dist - DLIGHT_CUTOFF, 0.0) / radius;
+-            vec3 dir         = light_dir / max(dist, 1.0);
+-            float lambert;
+-            
+-            if (dlights[i].color.r < 0.0)
+-                lambert = 1.0;
+-            else
+-                lambert = max(dot(v_norm, dir), 0.0);
+-            vec3 result      = ((dlights[i].color.rgb * dlights[i].color.a) * len) * lambert;
+-
+-            if (light_cone != 0.0) {
+-                float mag = -dot(dir, dlights[i].cone.xyz);
+-                result *= max(1.0 - (1.0 - mag) * (1.0 / (1.0 - light_cone)), 0.0);
+-            }
++    if (mode >= 2) {
++        // Reject before the sqrt. highp because the default is mediump on ES (line ~67):
++        // ANGLE-Metal maps mediump to half, whose 65504 ceiling is below both a plausible
++        // squared distance (8192^2) and a large light's radius^2 (1000^2), so a mediump
++        // compare would be decided by two infinities rather than by the geometry.
++        GLSL(
++            highp vec3 hp_dir = light_dir;
++            highp float d2 = dot(hp_dir, hp_dir);
++            highp float r2 = dlights[i].radius;
++        )
++        if (mode == 3) {
++            // MODE 3 IS DELIBERATELY WRONG, and it exists so that modes 1 and 2 can be
++            // believed. 1 and 2 are no-ops on the output by construction, so "the picture
++            // did not change" is equally consistent with "the early-out is exact" and with
++            // "the uniform never reached the shader and mode 0 ran the whole time". Mode 3
++            // rejects at HALF the radius, which is unmistakable on screen: switching to it
++            // is the one-command proof that the branch is live and switchable — in the
++            // simulator and in the headset — and switching away from it is the proof that
++            // the switch is not one-way. It is never a shipping value.
++            GLSL(
++                if (d2 >= r2 * r2 * 0.25)
++                    continue;
++            )
++        } else {
++            GLSL(
++                if (d2 >= r2 * r2)
++                    continue;
++            )
++        }
++    }
+ 
+-            shade += result;
++    GLSL(float dist = length(light_dir);)
++
++    if (mode == 1) {
++        GLSL(
++            if (dist >= dlights[i].radius)
++                continue;
++        )
++    }
++
++    GLSL(
++        float radius     = dlights[i].radius + DLIGHT_CUTOFF;
++        float len        = max(radius - dist - DLIGHT_CUTOFF, 0.0) / radius;
++        vec3 dir         = light_dir / max(dist, 1.0);
++        float lambert;
++
++        if (dlights[i].color.r < 0.0)
++            lambert = 1.0;
++        else
++            lambert = max(dot(v_norm, dir), 0.0);
++        vec3 result      = ((dlights[i].color.rgb * dlights[i].color.a) * len) * lambert;
++
++        if (light_cone != 0.0) {
++            float mag = -dot(dir, dlights[i].cone.xyz);
++            result *= max(1.0 - (1.0 - mag) * (1.0 / (1.0 - light_cone)), 0.0);
+         }
+ 
+-        return shade;
+-    })
++        shade += result;
++    )
++    GLSF("}\n");
+ }
+ 
++static void write_dynamic_lights(sizebuf_t *buf)
++{
++    // [vr overlay 0047] The mode branch is OUTSIDE the loop and reads a uniform, so mode 0
++    // runs upstream's loop with nothing added inside it, and switching modes needs neither
++    // a recompile nor a vid_restart. A uniform branch is fully coherent across every quad.
++    GLSF("vec3 calc_dynamic_lights() {\n");
++    GLSL(vec3 shade = vec3(0);)
++
++    GLSF("if (u_dlight_loop < 0.5) {\n");
++    write_dlight_loop(buf, 0);
++    GLSF("} else if (u_dlight_loop < 1.5) {\n");
++    write_dlight_loop(buf, 1);
++    GLSF("} else if (u_dlight_loop < 2.5) {\n");
++    write_dlight_loop(buf, 2);
++    GLSF("} else {\n");
++    write_dlight_loop(buf, 3);
++    GLSF("}\n");
++
++    GLSL(return shade;)
++    GLSF("}\n");
++}
++
+ static void write_shadedot(sizebuf_t *buf)
+ {
+     GLSL(
+@@ -1208,6 +1276,10 @@
+ 
+     gls.dlight_bits = 0;
+ 
++    // [vr overlay 0047] live per-light early-out mode; rides a former pad slot in the
++    // uniform block, so it costs no extra upload and needs no shader recompile.
++    gls.u_block.dlight_loop = gl_dlight_loop ? gl_dlight_loop->value : 0.0f;
++
+     shader_setup_fog();
+ 
+     R_RotateForSky();

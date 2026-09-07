@@ -6,9 +6,10 @@
 #   scripts/bootstrap.sh --build    # also build for a connected device
 #
 # What it does, in order:
-#   1. vendor/q2repro  — pinned upstream clone + the rerelease-game git SUBMODULE
-#      (a bare `git checkout` omits the submodule; overlay 0001 patches it, so it MUST
-#       be initialized first — this was the gap the upstream-bump drill surfaced).
+#   1. vendor/q2repro  — pinned upstream clone + BOTH git SUBMODULES it declares
+#      (subprojects/rerelease-game and q2proto). A bare `git checkout` omits them;
+#      overlay 0001 patches rerelease-game and xcodegen needs q2proto's sources, so
+#      both MUST be initialized first.
 #   2. overlay         — apply the reviewable patch series onto pristine vendor.
 #   3. native deps     — FFmpeg 7.1 + libcurl 8.11 iOS static libs (built once into
 #                        work/ios-deps; skipped if already present).
@@ -23,7 +24,7 @@ UPSTREAM_URL="https://github.com/Paril/q2repro.git"
 UPSTREAM_PIN="1523f1130f44253a518c8acd2b74e24fc0315477"
 VENDOR="$ROOT/vendor/q2repro"
 
-echo "== [1/4] vendor/q2repro @ ${UPSTREAM_PIN:0:12} + rerelease-game submodule =="
+echo "== [1/4] vendor/q2repro @ ${UPSTREAM_PIN:0:12} + submodules (rerelease-game, q2proto) =="
 if [ ! -d "$VENDOR/.git" ]; then
   git clone "$UPSTREAM_URL" "$VENDOR"
 fi
@@ -32,9 +33,14 @@ git -C "$VENDOR" fetch --quiet origin
 if [ -z "$(git -C "$VENDOR" status --porcelain)" ]; then
   git -C "$VENDOR" checkout --quiet "$UPSTREAM_PIN"
 fi
-git -C "$VENDOR" submodule update --init --recursive subprojects/rerelease-game
+# Upstream declares TWO submodules in .gitmodules: subprojects/rerelease-game and
+# q2proto. Both are required — without q2proto, xcodegen fails with 22 missing
+# sources. Take them all rather than naming one and forgetting the other again.
+git -C "$VENDOR" submodule update --init --recursive
 [ -f "$VENDOR/subprojects/rerelease-game/rerelease/game.h" ] || {
   echo "FATAL: rerelease-game submodule missing after init" >&2; exit 1; }
+[ -f "$VENDOR/q2proto/src/q2proto_client.c" ] || {
+  echo "FATAL: q2proto submodule missing after init" >&2; exit 1; }
 
 # Action Quake (aq2-tng) — classic-API game module (fs_game=action). Pinned clone, no overlay.
 AQ_URL="https://github.com/actionquake/aq2-tng"

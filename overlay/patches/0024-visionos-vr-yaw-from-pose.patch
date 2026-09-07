@@ -1,0 +1,114 @@
+Subject: [overlay 0024] visionOS VR — the rendered yaw comes from the pose, not the client sim
+
+The R3 root-cause fix for "jittery in both eyes as I look left and right" (first headset
+round, 1.0.11.3), gated on the same q2vr state block overlays 0022/0023 introduced, so iOS,
+the macOS oracle, the visionOS 2D window and the visionOS 3D panel are byte-for-byte
+unchanged.
+
+THE MECHANISM. R2 composed the rendered yaw as "the head's pitch and roll, plus THE GAME'S
+OWN VIEW YAW" — `yaw_relative` added `cl.refdef.viewangles[YAW]`, which in a live game is
+`cl.predicted_angles`, i.e. `cl.viewangles + delta_angles`. `cl.viewangles` is written by
+`CL_UpdateCmd`, which runs on the CLIENT SIM tick, not on every rendered frame: with
+`cl_async 0` and a `cl_maxfps` below the compositor's ~90 Hz cadence, `CL_Frame` returns
+without advancing the sim on a large fraction of VR frames (the same early-return the R2
+overlay already had to work around for the stale-left/fresh-right eye pair). So on those
+frames the head pose was FRESH and the yaw the frame rendered with was one to two ticks
+OLD. The compositor reprojects against the pose that was PUBLISHED, so every such frame was
+reprojected by the residual between the published yaw and the rendered yaw — and that
+residual is non-zero only while the head is turning, which is exactly and only when the
+jitter was seen. Pitch and roll were always written straight from the pose; neither shook.
+
+THE FIX (guide 12.7, the donors' architecture). The rendered yaw is body yaw + head yaw,
+both owned by the shell and both taken from the pair published THIS frame. The only
+engine-side term left is `server_yaw` — `ps.pmove.delta_angles[YAW]`, the server's own
+re-orientation — which is a STEP the server sets on a teleport or a spawn and is neither
+predicted, lerped nor smoothed. `yaw_relative` now selects THAT term. The angles the client
+SENDS keep coming from the same head pose one step earlier and may lag by a sim tick; that
+is the server's business and no longer the camera's.
+
+  * q2_vr_state_t gains an APPENDED R3 section (shared.h): server_yaw, render_yaw and
+    yaw_from_pose. The last two are identity-not-intent fields — what the frame ACTUALLY
+    rendered with — so an assertion and a device report compare against the frame rather
+    than against what the code is believed to do.
+  * client/view.c: the yaw composition, and the two identity fields written at the site.
+    `game_yaw` is kept and is now DIAGNOSTIC ONLY: it is the client-simulated yaw, and the
+    whole point of this patch is that the rendered basis no longer reads it.
+
+Nothing else in the engine changes. The panel-aspect and eye-sizing work of the same round
+lives entirely in the platform shell.
+
+Apply: patch -p1 -d vendor/q2repro < this
+--- a/inc/shared/shared.h
++++ b/inc/shared/shared.h
+@@ -1313,6 +1313,34 @@
+     int     ui_draw;
+     void  (*ui_begin)(void);    // bind the UI framebuffer (and clear it once per host frame)
+     void  (*ui_end)(void);      // bind back to the eye framebuffer
++
++    // [vr overlay R3] THE YAW SEPARATION. APPENDED, never inserted, for the same reason the
++    // R2 block was: the shell and the engine agree on this struct only by layout.
++    //
++    // R2 composed the rendered yaw as "the head's pitch and roll, plus THE GAME'S OWN VIEW
++    // YAW" (`yaw_relative` added cl.refdef.viewangles[YAW]). That number is
++    // cl.predicted_angles — cl.viewangles plus the server's delta — and it is produced by the
++    // CLIENT SIMULATION, which does not run on every rendered frame. The head pose is fresh
++    // every frame; the yaw the frame was rendered with was one to two client ticks old and
++    // only advanced when the sim advanced. The compositor reprojects against the pose it
++    // PUBLISHED, so every frame whose yaw had not caught up was reprojected by the residual —
++    // and the residual is non-zero only while the head is turning. That is the "jitter in
++    // both eyes as I look left and right" of the first headset round, and nothing else: pitch
++    // and roll were always written straight from the pose and never shook.
++    //
++    // The fix is the donors' architecture (guide 12.7): the rendered yaw is body yaw + head
++    // yaw, both owned by the shell and both taken from the pair published THIS frame, and the
++    // only engine contribution is `server_yaw` — the server's own re-orientation, which is a
++    // STEP the server sets on a teleport or a spawn and never a predicted, lerped or
++    // smoothed quantity. `yaw_relative` now selects THAT term and no longer reads any
++    // client-simulated angle.
++    float   server_yaw;         // WRITTEN BY THE ENGINE: ps.pmove.delta_angles[YAW], the
++                                // server's own re-orientation. Added when yaw_relative is set.
++    float   render_yaw;         // WRITTEN BY THE ENGINE: the yaw the frame ACTUALLY rendered
++                                // with (identity, not intent — the dumps report this one)
++    int     yaw_from_pose;      // WRITTEN BY THE ENGINE: 1 when the rendered basis came from
++                                // the published pose. 0 means something upstream fell back,
++                                // and a dump that says 0 is the diagnosis, not a guess.
+ } q2_vr_state_t;
+ 
+ extern q2_vr_state_t q2vr;
+--- a/src/client/view.c
++++ b/src/client/view.c
+@@ -614,10 +614,20 @@
+         // place that has to re-derive everything the engine already computed.
+         if (q2vr.active && q2vr.pose_valid) {
+             vec3_t vrang, vrf, vrr, vru;
+-            q2vr.game_yaw = cl.refdef.viewangles[YAW];
++            // [vr overlay R3] THE YAW SEPARATION (shared.h has the mechanism in full).
++            // `game_yaw` is kept, but it is now DIAGNOSTIC ONLY: it is the client-simulated
++            // view yaw, and the whole R3 fix is that the rendered basis no longer reads it.
++            // What the render adds to the shell's absolute yaw is `server_yaw` — the
++            // server's own re-orientation — which is a step function set on a teleport or a
++            // spawn, is neither predicted nor lerped, and is therefore the one engine-side
++            // term that cannot shake. Without it a teleport would rotate the player and
++            // leave the camera behind; with it, and with nothing else, the camera turns
++            // exactly when the head does and exactly when the server says so.
++            q2vr.game_yaw   = cl.refdef.viewangles[YAW];
++            q2vr.server_yaw = cl.frame.ps.pmove.delta_angles[YAW];
+             vrang[PITCH] = q2vr.viewangles[PITCH];
+             vrang[YAW]   = q2vr.viewangles[YAW] +
+-                           (q2vr.yaw_relative ? cl.refdef.viewangles[YAW] : 0.0f);
++                           (q2vr.yaw_relative ? q2vr.server_yaw : 0.0f);
+             vrang[ROLL]  = q2vr.viewangles[ROLL];
+             AngleVectors(vrang, vrf, vrr, vru);
+             VectorMA(cl.refdef.vieworg, q2vr.eyeofs[0], vrf, cl.refdef.vieworg);
+@@ -632,6 +642,11 @@
+                 cl.refdef.vieworg[2] += CL_VR_ClampRise(cl.refdef.vieworg, q2vr.rise);
+             VectorCopy(vrang, cl.refdef.viewangles);
+             VectorCopy(cl.refdef.vieworg, q2vr.vieworg);   // identity, not intent: what was used
++            // [vr overlay R3] Identity, not intent, for the yaw as well: what the frame was
++            // rendered with, so an assertion (and a device report) can compare it against the
++            // pose that was published instead of against what the code is believed to do.
++            q2vr.render_yaw = vrang[YAW];
++            q2vr.yaw_from_pose = 1;
+         } else if (cl_stereo_offset) {
+             // [stereo overlay] shift the eye sideways for stereoscopic 3D (parallel cameras — same
+             // view angles, so no vertical parallax). cl.v_right is set by CL_AddEntities above.

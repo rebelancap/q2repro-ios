@@ -1,0 +1,173 @@
+Subject: [overlay 0038] VR: the aim ray drives the weapon / inventory wheel
+
+In a VR world frame nothing ever called CL_Wheel_Input — the Sense sticks go to the
+snap-turn snapshot and CL_AdjustAngles (which carries the mouse/touch/stick wheel
+producers) is never reached — so the wheel opened, drew, holstered the gun and was
+inert: position stayed (0,0), distance 0, selected -1, and the release confirmed
+nothing.  This adds the fourth cursor producer, entirely inside the client (the wheel
+never touches game code): CL_iOS_VRWheelCursorNDC takes the aim ray as normalised HUD
+quad coordinates and converts them into the wheel's own pixel space, against geometry
+CAPTURED AT DRAW TIME because on visionOS r_config is only the HUD sub-rect inside the
+compositor's UI bracket.  Plus CL_iOS_WheelOpen / CL_iOS_WheelSelected (the shell's
+crosshair-visibility, flick-suppression and haptic reads) and CL_iOS_WheelDump
+(WHEELNOW, the suite's assertion channel).  patch -p1 -d vendor/q2repro < this
+
+
+--- a/src/client/wheel.c
++++ b/src/client/wheel.c
+@@ -24,6 +24,18 @@
+ // wheel appears under the finger and the touch cursor's origin is the button. -1 = default.
+ static vec2_t cl_ios_wheel_anchor = { -1.f, -1.f };
+ void CL_iOS_SetWheelAnchor(float ux, float uy) { cl_ios_wheel_anchor[0] = ux; cl_ios_wheel_anchor[1] = uy; }
++
++// [iOS overlay 0038] VR: the aim ray drives the wheel cursor, and the geometry it is converted
++// against is captured HERE, at draw time, rather than read at input time.
++//
++// Why: on visionOS the 2D stream is laid out for a widescreen SUB-RECT of the eye texture, and
++// r_config is switched to that sub-rect only inside the compositor's UI bracket. Read from the
++// input path — which runs outside the bracket — scr.hud_width/height/scale are the EYE's shape,
++// not the quad's, and a cursor converted against them would land somewhere the player is not
++// looking. Captured in CL_Wheel_Draw the mapping is exact by construction: the pixels the ray is
++// converted into are the pixels that were drawn.
++static float cl_ios_wheel_geo[5];   // half_w, half_h, centre_x, centre_y, wheel_size (REAL px)
++static int   cl_ios_wheel_geo_ok;
+ 
+ /* Draw item/ammo count for carousel and weapons/items wheel.
+  * Notably, the count should be drawn a bit smaller than usual
+@@ -344,9 +356,23 @@
+     /* The rerelease weapon wheel image (which we're using) has a 74 pixels padding of fully
+      * transparent pixels, ignore those then calculating scaling */
+     const int wheel_padding = 74;
+-    const int wheel_content_size = scr.wheel_size - wheel_padding;
++    int wheel_content_size = scr.wheel_size - wheel_padding;
+     int real_hud_height = scr.hud_height / scr.hud_scale;
+     int wheel_draw_size;
++    // [iOS overlay 0038] THE WHEEL ART IS A RERELEASE ASSET. With an original baseq2 the two
++    // R_RegisterPic calls in CL_Wheel_Precache fail ("Couldn't load gfx/weaponwheel.pcx") and
++    // scr.wheel_size stays 0, so wheel_content_size goes NEGATIVE — the integer division below
++    // then flips sign and this returns a negative size. Everything downstream inherits it: the
++    // input clamp radius is negative, so CL_Wheel_Input slams the cursor to MINUS the direction
++    // the player pointed and writes a negative `distance`, which is never > 140, so no slot is
++    // ever selectable. The wheel is unusable on original data for the mouse and the touch layer
++    // too; it is not a VR bug, it just took a VR round to notice. Fall back to a wheel the
++    // height of the HUD: the ring does not draw (there is no art), but every geometry that
++    // depends on its size stays sane and the selection works.
++    if (wheel_content_size < 1) {
++        int fallback = real_hud_height > 0 ? real_hud_height : 1;
++        return fallback * scr.hud_scale;
++    }
+     if (wheel_content_size >= real_hud_height) {
+         int wheel_size_div = (2 * wheel_content_size - 1) / real_hud_height;
+         wheel_draw_size = scr.wheel_size / wheel_size_div;
+@@ -379,7 +405,13 @@
+     
+     // clamp position & calculate dir
+     cl.wheel.distance = Vector2Length(cl.wheel.position);
+-    float inner_size = get_wheel_draw_size() / scr.hud_scale * 0.64f;
++    // [iOS overlay 0038] the clamp radius comes from the wheel that was DRAWN when one is on
++    // record. In VR the input path runs outside the compositor's UI bracket, so scr.hud_* here
++    // are the EYE's shape and the radius derived from them is far larger than the ring the
++    // player can see — the cursor would sail past the rim with nothing to stop it. Everywhere
++    // else the two shapes are the same number and this is the expression it replaces.
++    float inner_size = cl_ios_wheel_geo_ok ? cl_ios_wheel_geo[4] * 0.64f
++                                           : get_wheel_draw_size() / scr.hud_scale * 0.64f;
+ 
+     Vector2Clear(cl.wheel.dir);
+ 
+@@ -452,6 +484,80 @@
+     }
+ }
+ 
++// [iOS overlay 0038] ---- the VR wheel cursor -------------------------------------------------
++// The wheel is 100 % client-side: three producers already drive cl.wheel.position (the mouse,
++// the touch layer's absolute cursor, and the controller stick's slam-to-direction), and in a VR
++// world frame NONE of them runs — the Sense sticks go to the snap-turn snapshot and
++// CL_AdjustAngles is never reached. So the wheel opened, drew, holstered the gun and was inert.
++// These three exports are the fourth producer plus the two things the shell and the harness need
++// to read back. No game-code change: the wheel never leaves the client.
++
++// 0 = closed, 1 = the weapon wheel, 2 = the powerup / inventory wheel.
++int CL_iOS_WheelOpen(void)
++{
++    if (cl.wheel.state != WHEEL_OPEN)
++        return 0;
++    return cl.wheel.is_powerup_wheel ? 2 : 1;
++}
++
++// The slot under the cursor right now, or -1. Read by the VR shell so a selection CHANGE can be
++// felt in the hand — which is what makes a ring selectable without looking straight at it.
++int CL_iOS_WheelSelected(void)
++{
++    return cl.wheel.state == WHEEL_OPEN ? cl.wheel.selected : -1;
++}
++
++// The aim ray, as NORMALISED coordinates on the head-locked HUD quad: -1..1 left to right and
++// -1..1 top to bottom, over the quad's own extent. The shell intersects the aim hand's ray with
++// the quad the compositor placed and hands the result here, so this is a pure scale into the
++// wheel's pixel space followed by the SAME absolute-cursor trick CL_iOS_WheelCursor uses for a
++// finger. Returns 0 when no wheel is open, so the shell can skip the whole step.
++int CL_iOS_VRWheelCursorNDC(float u, float v)
++{
++    if (cl.wheel.state != WHEEL_OPEN)
++        return 0;
++
++    float hw = cl_ios_wheel_geo_ok ? cl_ios_wheel_geo[0] : (scr.hud_width  / scr.hud_scale) * 0.5f;
++    float hh = cl_ios_wheel_geo_ok ? cl_ios_wheel_geo[1] : (scr.hud_height / scr.hud_scale) * 0.5f;
++    float cx = cl_ios_wheel_geo_ok ? cl_ios_wheel_geo[2] : hw;
++    float cy = cl_ios_wheel_geo_ok ? cl_ios_wheel_geo[3] : hh;
++
++    // quad-relative pixels, then wheel-centre-relative pixels
++    float x = (u * hw + hw) - cx;
++    float y = (v * hh + hh) - cy;
++
++    CL_Wheel_Input((int)(x - cl.wheel.position[0]), (int)(y - cl.wheel.position[1]));
++    return 1;
++}
++
++// WHEELNOW's payload. The assertion channel for the suite: everything the selection depends on,
++// plus the active weapon, which is the only thing that proves the RELEASE confirmed.
++int CL_iOS_WheelDump(char *out, int n)
++{
++    int sel = (cl.wheel.state == WHEEL_OPEN) ? cl.wheel.selected : -1;
++    int item = (sel >= 0 && (size_t)sel < cl.wheel.num_slots) ? cl.wheel.slots[sel].item_index : -1;
++    int data = (sel >= 0 && (size_t)sel < cl.wheel.num_slots) ? cl.wheel.slots[sel].data_id : -1;
++    int owned = 0;
++
++    for (size_t i = 0; i < cl.wheel.num_slots; i++)
++        if (cl.wheel.slots[i].has_item)
++            owned++;
++
++    Q_snprintf(out, n,
++               "open=%d powerup=%d state=%d slots=%d owned=%d sel=%d item=%d dataid=%d dist=%.1f "
++               "pos=(%.1f,%.1f) dir=(%.3f,%.3f) slicesin=%.3f geo=%d halfw=%.1f halfh=%.1f "
++               "cx=%.1f cy=%.1f activeweap=%d timer=%.2f",
++               cl.wheel.state == WHEEL_OPEN ? 1 : 0,
++               cl.wheel.is_powerup_wheel ? 1 : 0,
++               (int)cl.wheel.state, (int)cl.wheel.num_slots, owned, sel, item, data,
++               cl.wheel.distance, cl.wheel.position[0], cl.wheel.position[1],
++               cl.wheel.dir[0], cl.wheel.dir[1], cl.wheel.slice_sin,
++               cl_ios_wheel_geo_ok, cl_ios_wheel_geo[0], cl_ios_wheel_geo[1],
++               cl_ios_wheel_geo[2], cl_ios_wheel_geo[3],
++               cl.frame.ps.stats[STAT_ACTIVE_WEAPON], cl.wheel.timer);
++    return cl.wheel.state == WHEEL_OPEN ? 1 : 0;
++}
++
+ static color_t slot_count_color(bool selected, bool warn_low)
+ {
+     color_t count_color;
+@@ -556,6 +662,15 @@
+     color_t base_color = COLOR_SETA_F(COLOR_WHITE, wheel_alpha);
+     int wheel_draw_size = get_wheel_draw_size();
+ 
++    // [iOS overlay 0038] the quad's real geometry, in the same un-hud_scaled pixels that
++    // cl.wheel.position and the `distance > 140` selection threshold live in.
++    cl_ios_wheel_geo[0] = (scr.hud_width  / scr.hud_scale) * 0.5f;
++    cl_ios_wheel_geo[1] = (scr.hud_height / scr.hud_scale) * 0.5f;
++    cl_ios_wheel_geo[2] = center_x / scr.hud_scale;
++    cl_ios_wheel_geo[3] = center_y / scr.hud_scale;
++    cl_ios_wheel_geo[4] = wheel_draw_size / scr.hud_scale;
++    cl_ios_wheel_geo_ok = 1;
++
+     R_DrawStretchPic(center_x - (wheel_draw_size / 2), center_y - (wheel_draw_size / 2), wheel_draw_size, wheel_draw_size, base_color, scr.wheel_circle);
+ 
+     // Draw all wheel slots, _except_ the current selected one

@@ -1,0 +1,287 @@
+visionOS VR R4 — hands: the viewmodel mount, the aim dot, delta-angles pitch, kick suppression
+
+The shell owns everything it can (the Sense stack, the composition, the arbitration, the grip
+rig). This is the residue that can only live in the engine, and it is four things:
+
+  * THE HAND BLOCK in q2vr, appended. `hand_ofs` is in the IDENTICAL form as `eyeofs`, so the
+    viewmodel mount is the eye composition with one substitution and hands, eyes and weapon
+    are in one frame by construction rather than by two derivations agreeing. Two angle sets:
+    `hand_ang` carries the grip calibration and places the MODEL, `hand_ray_ang` does not and
+    is what the shot and the dot use — one set would make the gun and the bullet disagree by
+    exactly the calibration.
+
+  * THE VIEWMODEL MOUNT at the tail of CL_AddViewWeapon, so the face-attached placement above
+    is overridden rather than fought and a mod's weapon lands in the hand for free. Weapon
+    Size comes out of the renderer's own entity scale, which pivots about the entity ORIGIN —
+    and the origin is now the grip point, so the slider pivots about the fist instead of about
+    the player's face. That is the bug a donor shipped and then had to fix by subtracting an
+    anchor before the multiply; here one point does both jobs. The muzzle flash is a separate
+    timed entity in this engine, so there is nothing to cull — the one line that would undo
+    the mount is the flash's reset to the VIEW angles, and that is now VR-gated.
+
+  * THE DELTA-ANGLES PITCH COMPENSATION in CL_UpdateCmd. The server's view direction is
+    viewangles + delta_angles. Yaw is already accounted for (the render adds the same term at
+    the view.c site); pitch was not, because the render takes pitch from the pose. So an
+    absolute pitch written here meant: die looking 35 degrees up, and for the rest of that
+    life every shot leaves the barrel 35 degrees off, with nothing on screen to say so.
+    `q2vrpitchcomp 0` restores the old behaviour exactly.
+
+  * THE AIM DOT, a world point at the traced hit drawn through the existing particle pipeline
+    — additive, billboarded, already scaled with distance (very nearly constant angular size).
+    Deliberately not a GL line beam: Metal has no wide lines, and that is the feature both
+    donors ended up deleting. Plus recoil kick suppressed under the VR gate, because in VR it
+    is a camera moving in a way the player's neck did not ask for.
+
+Every change is gated on `q2vr.active`, which no iOS, oracle or meson build ever sets.
+--- a/inc/shared/shared.h
++++ b/inc/shared/shared.h
+@@ -1341,6 +1341,38 @@
+     int     yaw_from_pose;      // WRITTEN BY THE ENGINE: 1 when the rendered basis came from
+                                 // the published pose. 0 means something upstream fell back,
+                                 // and a dump that says 0 is the diagnosis, not a guess.
++
++    // [vr overlay R4] THE HANDS. APPENDED, never inserted, for the third time and the same
++    // reason: the shell and the engine are separate translation units that agree on this
++    // struct only by layout.
++    //
++    // `hand_ofs` is in the IDENTICAL form as `eyeofs` — head-local forward/right/up, world
++    // units, measured from the play-space origin — so the viewmodel mount below is the eye
++    // composition with the hand's offset substituted for the eye's. Hands, eyes and weapon
++    // therefore live in one frame BY CONSTRUCTION rather than because two derivations were
++    // checked against each other, which is the mistake three donor bugs share.
++    //
++    // There are TWO angle sets on purpose. `hand_ang` carries the grip calibration and places
++    // the MODEL; `hand_ray_ang` does not, and is what the shot and the aim dot use. A single
++    // set would make the gun and the bullet disagree by exactly the calibration, and the dot
++    // would then confirm whichever one was wrong.
++    int     hand_valid;         // 1 = a tracked aim hand owns the viewmodel and the aim ray
++    float   hand_ofs[3];        // aim hand from the play origin, head-local axes, world units
++    float   hand_ang[3];        // WITH the grip correction (model frame), yaw carries the body
++    float   hand_ray_ang[3];    // WITHOUT it (the shot and the dot), yaw carries the body
++    float   grip_ofs[3];        // grip offset along the hand's OWN forward/right/up, units
++    float   weapon_scale;       // Weapon Size row, 0.5 .. 2.0
++    int     aim_dot;            // 1 = draw the world-space aim dot along the hand ray
++    float   aim_dot_scale;
++    int     pitch_comp;         // 1 = the sent pitch compensates delta_angles[PITCH]
++    int     suppress_kick;      // 1 = ps.kick_angles never reach the render angles
++
++    float   delta_pitch;        // WRITTEN BY THE ENGINE: the compensation term actually used
++    float   vm_org[3];          // WRITTEN BY THE ENGINE: where the viewmodel was mounted
++    float   vm_ang[3];          // WRITTEN BY THE ENGINE: the angles it was mounted with
++    int     vm_mounted;         // WRITTEN BY THE ENGINE: 1 = mounted to the hand this frame
++    float   dot_range;          // WRITTEN BY THE ENGINE: how far the aim trace reached
++    int     dot_drawn;          // WRITTEN BY THE ENGINE: 1 = the dot was actually added
+ } q2_vr_state_t;
+ 
+ extern q2_vr_state_t q2vr;
+--- a/src/client/client.h
++++ b/src/client/client.h
+@@ -895,6 +895,7 @@
+ // [vr overlay R2] ceiling clamp for the raised VR camera (see entities.c). Returns the
+ // vertical rise actually allowed this frame, ducking instantly and rising back eased.
+ float CL_VR_ClampRise(const vec3_t org, float want);
++void  CL_VR_AddAimDot(void);            // [vr overlay R4]
+ void CL_CalcViewValues(void);
+ 
+ #if USE_DEBUG
+--- a/src/client/entities.c
++++ b/src/client/entities.c
+@@ -1294,6 +1294,59 @@
+                 gun.backlerp = 1.0f - CL_KEYLERPFRAC;
+             }
+         }
++    }
++
++    // [vr overlay R4] THE HAND MOUNT. The tail of the placement, so the face-attached
++    // position above is OVERRIDDEN rather than fought: everything the game module contributed
++    // (the server-side weapon bob in gunangles, the gunoffset, the cl_gun_* nudges) has
++    // already been applied and is simply replaced, which is also how a mod's weapon lands in
++    // the hand for free.
++    //
++    // The composition is the EYE's own two lines with the hand's offset substituted for the
++    // eye's, which is what makes hands, eyes and weapon one frame by construction. The rise
++    // is added here too, because the eye's origin carries it and a gun that did not would
++    // hang at the player's navel for a tall player.
++    //
++    // The grip offset is applied along the HAND's own axes, not the view's: it is a property
++    // of how a fist holds a model, and it must not change when the player turns their head.
++    //
++    // WEAPON SIZE COMES FOR FREE, and correctly. The renderer scales an entity about its
++    // ORIGIN, and the origin is now the grip point — so the slider pivots about the fist
++    // instead of about the player's face, which is the bug a donor shipped and then had to
++    // fix by subtracting an anchor before the multiply. One point does both jobs here.
++    q2vr.vm_mounted = 0;
++    if (q2vr.active && q2vr.hand_valid) {
++        vec3_t vrang, vf, vr, vu, hf, hr, hu;
++        float sy = q2vr.yaw_relative ? cl.frame.ps.pmove.delta_angles[YAW] : 0.0f;
++
++        vrang[PITCH] = q2vr.viewangles[PITCH];
++        vrang[YAW]   = q2vr.viewangles[YAW] + sy;
++        vrang[ROLL]  = q2vr.viewangles[ROLL];
++        AngleVectors(vrang, vf, vr, vu);
++
++        VectorCopy(cl.refdef.vieworg, gun.origin);
++        gun.origin[2] += q2vr.rise_applied;
++        VectorMA(gun.origin, q2vr.hand_ofs[0], vf, gun.origin);
++        VectorMA(gun.origin, q2vr.hand_ofs[1], vr, gun.origin);
++        VectorMA(gun.origin, q2vr.hand_ofs[2], vu, gun.origin);
++
++        gun.angles[PITCH] = q2vr.hand_ang[PITCH];
++        gun.angles[YAW]   = q2vr.hand_ang[YAW] + sy;
++        gun.angles[ROLL]  = q2vr.hand_ang[ROLL];
++        AngleVectors(gun.angles, hf, hr, hu);
++        VectorMA(gun.origin, q2vr.grip_ofs[0], hf, gun.origin);
++        VectorMA(gun.origin, q2vr.grip_ofs[1], hr, gun.origin);
++        VectorMA(gun.origin, q2vr.grip_ofs[2], hu, gun.origin);
++
++        VectorCopy(gun.origin, gun.oldorigin);      // re-taken: the origin moved under it
++        if (q2vr.weapon_scale > 0.05f && q2vr.weapon_scale != 1.0f)
++            VectorSet(gun.scale, q2vr.weapon_scale, q2vr.weapon_scale, q2vr.weapon_scale);
++
++        // Identity, not intent. A dump that reported only `hand_valid` would have kept
++        // passing through every one of the donors' three failed viewmodel-anchor rounds.
++        VectorCopy(gun.origin, q2vr.vm_org);
++        VectorCopy(gun.angles, q2vr.vm_ang);
++        q2vr.vm_mounted = 1;
+     }
+ 
+     gun.flags = RF_MINLIGHT | RF_DEPTHHACK | RF_WEAPONMODEL;
+@@ -1343,7 +1396,14 @@
+     VectorMA(gun.origin, cl.weapon.muzzle.offset[1], right, gun.origin);
+     VectorMA(gun.origin, cl.weapon.muzzle.offset[2], up, gun.origin);
+ 
+-    VectorCopy(cl.refdef.viewangles, gun.angles);
++    // [vr overlay R4] The flash is a SEPARATE timed entity here (50 ms, its own model), not a
++    // ghost baked into the weapon mesh the way 1996's viewmodels park one behind the origin —
++    // so there is nothing to cull, and the offset above already rode the hand because it is
++    // taken along `gun.angles`. The one line that would undo it is this one: resetting the
++    // flash to the VIEW angles would leave it correctly positioned at the muzzle and pointing
++    // wherever the player's face happens to be. In VR it keeps the hand's orientation.
++    if (!(q2vr.active && q2vr.vm_mounted))
++        VectorCopy(cl.refdef.viewangles, gun.angles);
+     gun.angles[2] += cl.weapon.muzzle.roll;
+             
+     V_AddEntity(&gun);
+@@ -1352,7 +1412,13 @@
+ static void CL_SetupFirstPersonView(void)
+ {
+     // add kick angles
+-    if (cl_kickangles->integer) {
++    // [vr overlay R4] Recoil kick is added to the RENDER angles only (it never reaches
++    // cl.viewangles, so it does not fight the aim source). In VR it fights something worse:
++    // the camera is the player's head, and a weapon that jerks the world a few degrees on
++    // every shot is a camera moving in a way the neck did not ask for. Suppressed under the
++    // VR gate rather than through `cl_kickangles`, which is CVAR_CHEAT and is silently
++    // refused on any multiplayer server.
++    if (cl_kickangles->integer && !(q2vr.active && q2vr.suppress_kick)) {
+         vec3_t kickangles;
+         LerpAngles(CL_OLDKEYPS->kick_angles, CL_KEYPS->kick_angles, CL_KEYLERPFRAC, kickangles);
+         VectorAdd(cl.refdef.viewangles, kickangles, cl.refdef.viewangles);
+@@ -1361,6 +1427,11 @@
+     // add the weapon
+     CL_AddViewWeapon();
+ 
++    // [vr overlay R4] and the aim dot, AFTER it: CL_AddViewWeapon early-returns on cl_gun 0
++    // and on a missing model, and a player who has hidden the gun still has to be able to see
++    // where they are pointing.
++    CL_VR_AddAimDot();
++
+     cl.thirdPersonView = false;
+ }
+ 
+@@ -1413,6 +1484,68 @@
+ //
+ // Called once per EYE but eased once per host FRAME: q2vr.eye is 0 for the left eye, and
+ // advancing the ease twice per frame would double the rise rate on a whim of the render loop.
++// [vr overlay R4] THE WORLD-SPACE AIM DOT.
++//
++// A FLAT crosshair fuses at no distance: each eye is told the reticle is at the screen while
++// the surface behind it is metres away, and the player's eyes are asked to converge on two
++// depths at once. So the dot is a WORLD POINT at the traced hit, and its depth cue is the
++// ordinary stereo parallax of a point at that range — nothing special is required of the
++// renderer to produce it.
++//
++// It goes through the PARTICLE pipeline, which already exists, is already additive when
++// `gl_partstyle` says so, already billboards to the view, and already grows its quad with
++// distance (`1 + dist*0.004` in tess.c) — which is very nearly constant angular size, i.e.
++// exactly the behaviour a reticle wants. Deliberately NOT a GL line beam: Metal has no wide
++// lines, so a line-mode beam is one aliased pixel at an eye's resolution, and it is the
++// feature both donors ended up deleting.
++//
++// The ray is `hand_ray_ang` — the UNGRIPPED hand direction — because the dot exists to tell
++// the player where the shot goes, and the grip calibration moves only the model. And the
++// ORIGIN is the eye, not the hand: the server's hitscan starts at the player's body, so a dot
++// drawn from the muzzle would confidently disagree with the bullet in the near field. That
++// parallax is a documented, accepted limitation of not moving the player edict server-side
++// (charter §1 OUT), and the honest thing is to show the same ray the server will trace.
++#define VR_DOT_RANGE 8192.0f
++void CL_VR_AddAimDot(void)
++{
++    particle_t p;
++    trace_t tr;
++    vec3_t start, end, f, r, u, mins, maxs;
++
++    q2vr.dot_drawn = 0;
++    q2vr.dot_range = 0.0f;
++    if (!q2vr.active || !q2vr.aim_dot || !q2vr.hand_valid)
++        return;
++    if (!cl.bsp || !cl.bsp->nodes)
++        return;
++
++    AngleVectors(q2vr.hand_ray_ang, f, r, u);
++    VectorCopy(cl.refdef.vieworg, start);
++    VectorMA(start, VR_DOT_RANGE, f, end);
++    VectorSet(mins, 0, 0, 0);
++    VectorSet(maxs, 0, 0, 0);
++    CL_LerpedTrace(&tr, start, end, mins, maxs, MASK_SOLID);
++    if (tr.startsolid || tr.allsolid)
++        return;
++
++    q2vr.dot_range = VR_DOT_RANGE * tr.fraction;
++    // Lift off the surface proportionally rather than by a fixed amount: collision geometry is
++    // chorded more coarsely than the drawn mesh, so a constant pull-back that hides the seam
++    // at ten metres floats visibly at one.
++    VectorMA(tr.endpos, -max(1.0f, q2vr.dot_range * 0.004f), f, p.origin);
++    p.color = -1;
++    p.rgba.u8[0] = 255;
++    p.rgba.u8[1] = tr.fraction >= 1.0f ? 150 : 235;   // a sky miss reads dimmer, on purpose
++    p.rgba.u8[2] = tr.fraction >= 1.0f ? 150 : 190;
++    p.rgba.u8[3] = 255;
++    p.alpha = 1.0f;
++    // The particle pipeline already scales with distance, so this is an angular size and not
++    // a world size; 1.0 is the shipped default and `q2vrdot <on> <scale>` tunes it live.
++    p.scale = q2vr.aim_dot_scale > 0.01f ? q2vr.aim_dot_scale : 1.0f;
++    V_AddParticle(&p);
++    q2vr.dot_drawn = 1;
++}
++
+ #define VR_RISE_SPEED   40.0f       // units per second, upward only
+ float CL_VR_ClampRise(const vec3_t org, float want)
+ {
+--- a/src/client/input.c
++++ b/src/client/input.c
+@@ -764,7 +764,23 @@
+     // clamp (a 90-degree-down look must not wrap the player), while the RENDER pitch stays
+     // the head's true one. Roll is never sent - a rolled usercmd is not a thing Q2 has.
+     if (q2vr.active && q2vr.aim_valid) {
+-        cl.viewangles[PITCH] = q2vr.aim_angles[PITCH];
++        // [vr overlay R4] THE DELTA-ANGLES PITCH COMPENSATION, and it is not cosmetic.
++        //
++        // The server's view direction is `cl.viewangles + ps.pmove.delta_angles`, and it sets
++        // `delta_angles` on a spawn, a respawn or a teleport to re-orient the player. YAW is
++        // already accounted for: the render adds the same `delta_angles[YAW]` at the view.c
++        // site, so the camera and the server agree by construction. PITCH is not — the render
++        // takes pitch straight from the pose. So writing an absolute head/hand pitch here
++        // means: die looking 35 degrees up, and for the rest of that life every shot leaves
++        // the barrel 35 degrees off where the player is pointing, with NOTHING on screen to
++        // say so. Subtracting the term makes the EFFECTIVE pitch the one the hand is holding.
++        //
++        // CL_ClampPitch below already clamps `viewangles + delta` and re-derives `viewangles`
++        // from it, so the subtraction composes with the clamp rather than fighting it.
++        // `q2vrpitchcomp 0` restores the old behaviour exactly, which is what makes this a
++        // provable fix rather than an asserted one.
++        q2vr.delta_pitch = q2vr.pitch_comp ? cl.frame.ps.pmove.delta_angles[PITCH] : 0.0f;
++        cl.viewangles[PITCH] = q2vr.aim_angles[PITCH] - q2vr.delta_pitch;
+         cl.viewangles[YAW]   = q2vr.aim_angles[YAW];
+         cl.viewangles[ROLL]  = 0.0f;
+     }

@@ -121,6 +121,12 @@ scripts/build-curl-visionos.sh
 scripts/build-visionos.sh        # the merged 2D+3D visionOS app
 ```
 
+Always run `scripts/gen-app-project.sh` before `xcodegen`/`xcodebuild` (bootstrap does
+it for you): the committed `app/project.yml` carries a literal `Q2_DEV_BUILD=1`, and it
+is `gen-app-project.sh` that rewrites it from the version string — a 3-component
+`MARKETING_VERSION` (e.g. `1.1.0`) produces the public configuration, a 4-component one
+(e.g. `1.1.0.2`) an OTA-only dev build.
+
 Upstream q2repro is vendored unmodified and pinned by commit; every local change is
 a reviewable patch in `overlay/patches/`, applied by `scripts/apply-overlay.sh`.
 

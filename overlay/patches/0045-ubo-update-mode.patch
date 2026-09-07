@@ -1,0 +1,246 @@
+R20 — how the per-batch UBOs are UPDATED, as a measurable variable, and the fix that came
+out of measuring it.
+
+THE SYMPTOM. One wall panel on base1 is lit in one eye and dark in the other, on the device
+and (with overlay 0044's injected asymmetric frustum) on the simulator. Everything upstream
+of the pixel was measured EQUAL between the eyes at a reproducing pose
+(artifacts/vr-r20/DIAG-per-eye-spot.md): the light list, the per-face dlightbits, the stamp
+gate, the batch union, the lightmap atlas, and the dlight UBO's bytes as captured on the CPU.
+What no CPU-side instrument can see is what a DRAW READS.
+
+THE MECHANISM. Both per-batch UBOs — gl_static.dlight_buffer and gl_static.uniform_buffer —
+are GL_DYNAMIC_DRAW buffers that shader.c re-uploads with a PARTIAL glBufferSubData once per
+batch whose contents changed, while the PREVIOUS batch's draw, which reads the same buffer
+object, is still pending inside ANGLE's Metal command buffer. Whether that read sees the old
+or the new contents is up to the driver's in-flight-buffer handling. It is per eye, per yaw,
+deterministic for a given draw sequence, and invisible to every instrument that looks at the
+CPU side — which is exactly the shape of the symptom.
+
+THE EXPERIMENT (cvars, so it could be measured rather than argued):
+
+  gl_dlight_ubo   the dynamic-light UBO ... 0 = as upstream (partial glBufferSubData)
+  gl_ublock_ubo   the uniform block UBO  ... 1 = ORPHAN  (glBufferData(size, NULL) first, then
+                                                 a full-size upload: the old contents are
+                                                 declared dead and the driver may hand back
+                                                 fresh storage instead of stalling or aliasing)
+                                             2 = RING    (UBO_RING_SIZE distinct buffers, one
+                                                 upload each, rebound with glBindBufferBase)
+                                             3 = FINISH  (glFinish after each upload)
+
+Two cvars, so the two buffers can be told apart.
+
+THE RESULT (artifacts/vr-r20/DIAG-ubo.md). At the reproducing pose, mode 0 splits the eyes by
+dLuma 11.99 over 38 % of the frame, reproducibly, and EVERY other mode closes it to 0.0000 —
+both eyes then render the LIT image. Orphaning alone is enough, on the dlight UBO alone. The
+default is therefore 1 for the dlight buffer, which is where the light set lives; the uniform
+block keeps upstream's update (mode 0) because it was never shown to be affected and every
+change to the shipped path has to earn itself.
+
+Leaving ring mode restores the original buffer on the binding point — without that, a later
+mode-0 upload writes a buffer nothing reads and the shader keeps sampling the last ring
+entry: a frozen light set that measures as a perfect fix. That artefact ate the first run of
+this experiment.
+
+--- a/src/refresh/gl.h
++++ b/src/refresh/gl.h
+@@ -73,6 +73,9 @@
+ #define TEXNUM_PP_BLUR_0        AUTO_TEX(11)
+ #define TEXNUM_PP_BLUR_1        AUTO_TEX(12)
+ 
++// [vr overlay 0045] size of the UBO ring used by gl_dlight_ubo/gl_ublock_ubo mode 2.
++#define UBO_RING_SIZE   32
++
+ // framebuffers
+ #define FBO_COUNT   3
+ #define FBO_SCENE   gl_static.framebuffers[0]
+@@ -105,6 +108,13 @@
+     GLuint          default_framebuffer;    // iOS EAGL: app framebuffer that presents to screen; 0 on desktop
+     GLuint          uniform_buffer;
+     GLuint          dlight_buffer;
++    // [vr overlay 0045] UBO update-mode experiment (gl_dlight_ubo / gl_ublock_ubo == 2):
++    // a ring of distinct buffer objects so no upload ever touches a buffer a pending draw
++    // may still be reading. Created at shader_init regardless of the cvar; unused at mode 0.
++    GLuint          dlight_ring[UBO_RING_SIZE];
++    GLuint          ublock_ring[UBO_RING_SIZE];
++    int             dlight_ring_i;
++    int             ublock_ring_i;
+ #if USE_MD5
+     GLuint          skeleton_buffer;
+     GLuint          skeleton_tex[2];
+@@ -296,6 +306,10 @@
+ extern cvar_t *gl_lightdiag;
+ extern cvar_t *gl_batchshots;   // [vr overlay 0044 — R20 diagnostic] PPLBATCH one-shot
+ extern cvar_t *gl_dlight_batchkey;  // [vr overlay 0045]
++// [vr overlay 0045] how the two per-batch UBOs are updated: 0 partial glBufferSubData (as
++// upstream), 1 orphan-then-upload, 2 ring of UBO_RING_SIZE buffers, 3 glFinish after upload.
++extern cvar_t *gl_dlight_ubo;
++extern cvar_t *gl_ublock_ubo;
+ extern cvar_t *gl_dlight_falloff;
+ extern cvar_t *gl_modulate_entities;
+ extern cvar_t *gl_glowmap_intensity;
+--- a/src/refresh/main.c
++++ b/src/refresh/main.c
+@@ -80,6 +80,21 @@
+ // [vr overlay 0045] see tess.c GL_DrawFace: 1 makes a face's per-pixel light set its own
+ // bits rather than its batch's union, which is what makes the shading view-independent.
+ cvar_t *gl_dlight_batchkey;
++// [vr overlay 0045] HOW the two per-batch UBOs are written, not what is written into them.
++// Both `gl_static.dlight_buffer` and `gl_static.uniform_buffer` are GL_DYNAMIC_DRAW UBOs that
++// shader.c re-uploads with a PARTIAL glBufferSubData once per batch whose contents changed —
++// while the PREVIOUS batch's draw, which reads the same buffer object, is still queued inside
++// ANGLE's Metal command buffer. Whether that is safe is entirely up to the driver's in-flight
++// buffer handling, and it is invisible to every CPU-side instrument (the bytes we upload are
++// provably identical between the eyes; what a draw READS need not be).
++//   0  as upstream: partial glBufferSubData into the one buffer
++//   1  ORPHAN: glBufferData(size, NULL) first, then a full-size upload, so the driver is told
++//      the old contents are dead and is free to hand back fresh storage
++//   2  RING: UBO_RING_SIZE distinct buffer objects, one upload each, rebound with
++//      glBindBufferBase — no buffer is ever written twice within a ring's worth of draws
++//   3  FINISH: glFinish() after each upload — decisive, and far too slow to ship
++cvar_t *gl_dlight_ubo;
++cvar_t *gl_ublock_ubo;
+ cvar_t *gl_dlight_falloff;
+ cvar_t *gl_modulate_entities;
+ cvar_t *gl_glowmap_intensity;
+@@ -1347,6 +1362,17 @@
+     // visible on the simulator, turning it on changed the picture by at most 1/255 and did
+     // not close the split (artifacts/vr-r20/DIAG-per-eye-spot.md). Off until it earns its way in.
+     gl_dlight_batchkey = Cvar_Get("gl_dlight_batchkey", "0", 0);
++    // [vr overlay 0045] DEFAULT 1 (ORPHAN) — this is the per-eye lighting fix, not an
++    // experiment. Measured at two reproducing poses on base1, seven interleaved controls
++    // each (artifacts/vr-r20/DIAG-ubo.md): mode 0 splits the eyes by dLuma 11.99 over 38 %
++    // of the frame (and 23.90 over 62 % at the second pose) every single time it is put
++    // back, and modes 1, 2 and 3 all close it to 0.0000 with both eyes rendering the LIT
++    // image. Orphaning is the cheapest of the three (no extra buffers, no rebinding, no
++    // stall) and costs nothing measurable: 60.00 Hz engine rate either way at the pose.
++    // The uniform block is left on upstream's update (0): all three modes were measured on
++    // it too and NONE changed the picture, so the shipped path there is untouched.
++    gl_dlight_ubo = Cvar_Get("gl_dlight_ubo", "1", 0);
++    gl_ublock_ubo = Cvar_Get("gl_ublock_ubo", "0", 0);
+     gl_dynamic->changed = gl_lightmap_changed;
+     gl_dlight_falloff = Cvar_Get("gl_dlight_falloff", "1", 0);
+     gl_modulate_entities = Cvar_Get("gl_modulate_entities", "1", 0);
+--- a/src/refresh/shader.c
++++ b/src/refresh/shader.c
+@@ -1010,11 +1010,51 @@
+ {
+     qglVertexAttrib4f(VERT_ATTR_COLOR, r, g, b, a);
+ }
++
++// [vr overlay 0045] The four UBO update modes, shared by the two per-batch UBOs. See the
++// gl_dlight_ubo block in main.c for why this is a variable at all. `ring` may be NULL for a
++// buffer that has no ring (it is then treated as mode 0/1/3).
++static void shader_upload_ubo(int mode, GLuint single, GLuint *ring, int *ring_i,
++                              GLuint base_index, GLsizeiptr size, const void *data)
++{
++    if (mode == 2 && ring && ring[0]) {
++        *ring_i = (*ring_i < 0) ? 0 : (*ring_i + 1) % UBO_RING_SIZE;
++        GLuint buf = ring[*ring_i];
++        GL_BindBuffer(GL_UNIFORM_BUFFER, buf);
++        qglBufferData(GL_UNIFORM_BUFFER, size, data, GL_DYNAMIC_DRAW);
++        // GL_BindBufferBase always calls through (gl.h caches, but never elides the base
++        // bind), so the rebind cannot be dropped — that would leave the previous ring entry
++        // bound and make the whole experiment a no-op.
++        GL_BindBufferBase(GL_UNIFORM_BUFFER, base_index, buf);
++        return;
++    }
+ 
++    // Leaving ring mode has to put the ORIGINAL buffer back on the binding point, or every
++    // later upload writes a buffer nothing reads and the shader keeps sampling the last ring
++    // entry — a frozen light set that looks exactly like a fix. (This bit the first run of
++    // the experiment: every row after the first ring row was measuring stale lights.)
++    if (ring && ring[0] && *ring_i >= 0) {
++        GL_BindBufferBase(GL_UNIFORM_BUFFER, base_index, single);
++        *ring_i = -1;
++    }
++
++    GL_BindBuffer(GL_UNIFORM_BUFFER, single);
++    if (mode == 1)
++        qglBufferData(GL_UNIFORM_BUFFER, size, NULL, GL_DYNAMIC_DRAW);
++    qglBufferSubData(GL_UNIFORM_BUFFER, 0, size, data);
++    if (mode == 3)
++        qglFinish();
++}
++
+ static void shader_load_uniforms(void)
+ {
+-    GL_BindBuffer(GL_UNIFORM_BUFFER, gl_static.uniform_buffer);
+-    qglBufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(gls.u_block), &gls.u_block);
++    const int mode = gl_ublock_ubo ? gl_ublock_ubo->integer : 0;
++
++    // mode 0/3 upload exactly what upstream uploads (the whole block); 1 and 2 upload the
++    // same bytes through a different buffer lifetime. Nothing about the CONTENT changes.
++    shader_upload_ubo(mode, gl_static.uniform_buffer, gl_static.ublock_ring,
++                      &gl_static.ublock_ring_i, UBO_UNIFORMS,
++                      sizeof(gls.u_block), &gls.u_block);
+     c.uniformUploads++;
+ }
+ 
+@@ -1084,8 +1124,21 @@
+                    (unsigned long long)glr.ppl_dlight_bits, i, h);
+     }
+ 
+-    GL_BindBuffer(GL_UNIFORM_BUFFER, gl_static.dlight_buffer);
+-    qglBufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(GLint[4]) + (sizeof(gls.u_dlights.lights[0]) * gls.u_dlights.num_dlights), &gls.u_dlights);
++    // [vr overlay 0045] Upstream uploads only the header plus the live lights — a PARTIAL
++    // update of a buffer whose previous contents the previous batch's still-queued draw may
++    // be reading. Modes 1-3 remove that overlap in three different ways; mode 0 keeps the
++    // partial upload byte for byte.
++    {
++        const int mode = gl_dlight_ubo ? gl_dlight_ubo->integer : 0;
++        const GLsizeiptr partial = sizeof(GLint[4]) +
++            (GLsizeiptr)(sizeof(gls.u_dlights.lights[0]) * gls.u_dlights.num_dlights);
++        // Orphan/ring must respecify the WHOLE buffer or the tail is undefined; only mode 0
++        // keeps the short upload.
++        const GLsizeiptr size = (mode == 0 || mode == 3) ? partial : (GLsizeiptr)sizeof(gls.u_dlights);
++
++        shader_upload_ubo(mode, gl_static.dlight_buffer, gl_static.dlight_ring,
++                          &gl_static.dlight_ring_i, UBO_DLIGHTS, size, &gls.u_dlights);
++    }
+     c.uniformUploads++;
+     c.dlightUploads++;
+ }
+@@ -1247,7 +1300,26 @@
+     GL_BindBuffer(GL_UNIFORM_BUFFER, gl_static.dlight_buffer);
+     GL_BindBufferBase(GL_UNIFORM_BUFFER, UBO_DLIGHTS, gl_static.dlight_buffer);
+     qglBufferData(GL_UNIFORM_BUFFER, sizeof(gls.u_dlights), NULL, GL_DYNAMIC_DRAW);
++
++    // [vr overlay 0045] The mode-2 rings. Created unconditionally so the cvar can be flipped
++    // live in a measurement session; ~32 x (sizeof(u_dlights) + sizeof(u_block)) of VRAM and
++    // not one byte of traffic while the mode is 0.
++    qglGenBuffers(UBO_RING_SIZE, gl_static.dlight_ring);
++    for (int i = 0; i < UBO_RING_SIZE; i++) {
++        GL_BindBuffer(GL_UNIFORM_BUFFER, gl_static.dlight_ring[i]);
++        qglBufferData(GL_UNIFORM_BUFFER, sizeof(gls.u_dlights), NULL, GL_DYNAMIC_DRAW);
++    }
++    qglGenBuffers(UBO_RING_SIZE, gl_static.ublock_ring);
++    for (int i = 0; i < UBO_RING_SIZE; i++) {
++        GL_BindBuffer(GL_UNIFORM_BUFFER, gl_static.ublock_ring[i]);
++        qglBufferData(GL_UNIFORM_BUFFER, sizeof(gls.u_block), NULL, GL_DYNAMIC_DRAW);
++    }
++    gl_static.dlight_ring_i = gl_static.ublock_ring_i = -1;   // -1 = the single buffer is bound
+ 
++    // Leave the shipped bindings in place: mode 0 must be byte-identical to upstream.
++    GL_BindBufferBase(GL_UNIFORM_BUFFER, UBO_UNIFORMS, gl_static.uniform_buffer);
++    GL_BindBufferBase(GL_UNIFORM_BUFFER, UBO_DLIGHTS, gl_static.dlight_buffer);
++
+     // precache common shader
+     shader_use_program(GLS_DEFAULT);
+ 
+@@ -1279,6 +1351,16 @@
+         qglDeleteBuffers(1, &gl_static.dlight_buffer);
+         gl_static.dlight_buffer = 0;
+     }
++    // [vr overlay 0045]
++    if (gl_static.dlight_ring[0]) {
++        qglDeleteBuffers(UBO_RING_SIZE, gl_static.dlight_ring);
++        memset(gl_static.dlight_ring, 0, sizeof(gl_static.dlight_ring));
++    }
++    if (gl_static.ublock_ring[0]) {
++        qglDeleteBuffers(UBO_RING_SIZE, gl_static.ublock_ring);
++        memset(gl_static.ublock_ring, 0, sizeof(gl_static.ublock_ring));
++    }
++    gl_static.dlight_ring_i = gl_static.ublock_ring_i = 0;
+ 
+ #if USE_MD5
+     if (gl_static.skeleton_buffer) {

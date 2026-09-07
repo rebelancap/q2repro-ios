@@ -369,12 +369,18 @@ final class XRRenderer {
 
     private func renderFrame() {
         guard let frame = layer.queryNextFrame() else { return }
-        frame.startUpdate(); frame.endUpdate()
+        // predictTiming BEFORE startUpdate: a nil timing must abort with nothing started
+        // (the merged shell's ordering, VisionShell.swift). The old order opened an update
+        // phase it then abandoned.
         guard let timing = frame.predictTiming() else { return }
+        frame.startUpdate(); frame.endUpdate()
         LayerRenderer.Clock().wait(until: timing.optimalInputTime)
         frame.startSubmission()
         let drawables = frame.queryDrawables()
-        guard let drawable = drawables.first else { frame.endSubmission(); return }
+        // An empty queryDrawables (space being dismissed) INVALIDATES the frame: calling
+        // endSubmission on it aborts __BUG_IN_CLIENT__ ("failures from
+        // cp_frame_query_drawables properly handled?"). Just return — nothing to end.
+        guard let drawable = drawables.first else { return }
         let t = drawable.frameTiming.presentationTime.timeInterval
         if let a = worldTracking.queryDeviceAnchor(atTimestamp: t) { drawable.deviceAnchor = a }
 

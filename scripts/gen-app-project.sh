@@ -26,7 +26,7 @@ settings:
     TARGETED_DEVICE_FAMILY: "1"
     ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon   # app icon (Assets.xcassets)
     STRIP_INSTALLED_PRODUCT: NO   # archives strip exported symbols → dlsym-class silent crashes
-    MARKETING_VERSION: "1.0.11"
+    MARKETING_VERSION: "1.1.0"
     CURRENT_PROJECT_VERSION: "1"
     GCC_C_LANGUAGE_STANDARD: gnu11
     GCC_WARN_ABOUT_DEPRECATED_FUNCTIONS: NO
@@ -345,8 +345,32 @@ YAML
   sed -i ''     -e 's/^      - sdk: Metal.framework$/      - sdk: Metal.framework\
       - sdk: CompositorServices.framework\
       - sdk: SwiftUI.framework\
+      - sdk: CoreHaptics.framework\
       - sdk: ARKit.framework/'     "$OUT"
-  echo "retargeted $OUT for the MERGED visionOS 2D+3D app (Q2_XR_UI)"
+  # ---- PSVR2 Sense controllers (R4). BOTH keys, in the GENERATOR, hand-edit style.
+  #
+  # GCSupportedGameControllers/SpatialGamepad is what makes the pair enumerate as two
+  # `GCProductCategorySpatialController` devices instead of ONE aggregate MFi gamepad. Without
+  # it, `ar_accessory_load_from_device` fails with error 1200 and there is no per-hand
+  # anything — and the shell's error-1200 decoder exists precisely to name that cause.
+  #
+  # NSAccessoryTrackingUsageDescription is the string the accessory-tracking permission prompt
+  # shows. A missing usage string is a launch-time crash on the first request, not a denial.
+  #
+  # Written HERE rather than through Xcode's capability editor on purpose: the editor rewrites
+  # the whole entitlement/plist block and has eaten existing ARKit values on both donor ports.
+  # A generator cannot be eaten, and `Info.plist` is regenerated from this file every build.
+  #
+  # The one-fist gamepad filter (main.m `pollController`) ships in the SAME build as this
+  # declaration, always — the declaration alone is the game being driven from one hand.
+  SENSE="$(mktemp)"; cat > "$SENSE" <<'PLIST'
+        NSAccessoryTrackingUsageDescription: q2repro tracks your PSVR2 Sense controllers so you can aim with your hands.
+        GCSupportedGameControllers:
+          - ProfileName: SpatialGamepad
+          - ProfileName: ExtendedGamepad
+PLIST
+  sed -i '' -e "/CFBundleIconName: AppIcon/r $SENSE" "$OUT"; rm -f "$SENSE"
+  echo "retargeted $OUT for the MERGED visionOS 2D+3D app (Q2_XR_UI, Sense + CoreHaptics)"
 fi
 
 # ---- visionOS-3D (immersive) variant: SwiftUI + Compositor Services shell driving the engine

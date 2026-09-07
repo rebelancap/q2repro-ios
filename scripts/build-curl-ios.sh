@@ -38,7 +38,7 @@ rm -rf "build-ios-$BUILD_ENV"
 echo "== configuring libcurl for iOS arm64 $BUILD_ENV (SecureTransport, HTTP-only) =="
 cmake -B "build-ios-$BUILD_ENV" -G "Unix Makefiles" \
     -DCMAKE_SYSTEM_NAME=iOS \
-    "${SYSROOT_ARGS[@]}" \
+    ${SYSROOT_ARGS[@]+"${SYSROOT_ARGS[@]}"} \
     -DCMAKE_OSX_ARCHITECTURES=arm64 \
     -DCMAKE_OSX_DEPLOYMENT_TARGET="$MIN_IOS" \
     -DCMAKE_INSTALL_PREFIX="$PREFIX" \

@@ -32,6 +32,8 @@
 #include "client/video.h"
 #include "refresh/refresh.h"
 
+extern void Q2_VR_ConPrintf(const char *fmt, ...) q_printf(1, 2);   // [R7b 8a] Com_Printf, never the notify feed
+
 #ifndef EGL_PLATFORM_ANGLE_ANGLE
 #define EGL_PLATFORM_ANGLE_ANGLE 0x3202
 #define EGL_PLATFORM_ANGLE_TYPE_ANGLE 0x3203
@@ -97,7 +99,7 @@ static bool a_init(void) {
     if (s_dpy == EGL_NO_DISPLAY) { Com_EPrintf("xr: no display\n"); return false; }
     EGLint major, minor;
     if (!eglInitialize(s_dpy, &major, &minor)) { Com_EPrintf("xr: eglInitialize 0x%x\n", eglGetError()); return false; }
-    Com_Printf("xr: ANGLE %s (EGL %d.%d)\n", eglQueryString(s_dpy, EGL_VENDOR), major, minor);
+    Q2_VR_ConPrintf("xr: ANGLE %s (EGL %d.%d)\n", eglQueryString(s_dpy, EGL_VENDOR), major, minor);
 
     const EGLint cfga[] = { EGL_SURFACE_TYPE, EGL_PBUFFER_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
                             EGL_RED_SIZE,8, EGL_GREEN_SIZE,8, EGL_BLUE_SIZE,8, EGL_ALPHA_SIZE,8,
@@ -110,7 +112,7 @@ static bool a_init(void) {
     if (!eglMakeCurrent(s_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, s_ctx)) {
         Com_EPrintf("xr: surfaceless makeCurrent 0x%x\n", eglGetError()); return false;
     }
-    Com_Printf("xr: ES3 context created (surfaceless)\n");
+    Q2_VR_ConPrintf("xr: ES3 context created (surfaceless)\n");
     return true;
 }
 static void a_shutdown(void) {

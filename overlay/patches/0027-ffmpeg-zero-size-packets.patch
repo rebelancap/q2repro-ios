@@ -1,0 +1,74 @@
+--- a/src/client/cin.c
++++ b/src/client/cin.c
+@@ -340,6 +340,52 @@ static int decode_frames(DecoderState *s)
+                     // wait for more packets...
+                     return 0;
+                 }
++            } else if (!pkt->size) {
++                // A ZERO-SIZE PACKET IS NOT AN ERROR, AND FEEDING IT TO THE
++                // DECODER IS FATAL. Since FFmpeg 6.1 avcodec_send_packet()
++                // rejects any packet with data but size 0 outright:
++                //
++                //     if (avpkt && !avpkt->size && avpkt->data)
++                //         return AVERROR(EINVAL);
++                //
++                // and it does so SILENTLY — no av_log line, so the only trace
++                // is this loop's own "Error submitting video packet for
++                // decoding: Invalid argument", which aborts the cinematic and
++                // tears the server down.
++                //
++                // SCOPE: this skip is in decode_frames(), which is SHARED by
++                // every stream this file decodes — Theora and idcin video,
++                // Vorbis and pcm_u8 audio, and whatever a future container
++                // adds. So it drops a zero-size packet from ANY of them, not
++                // just Theora's, and it would equally drop a hypothetical
++                // side-data-only packet that carried no payload. That is
++                // deliberate and safe: a packet with no payload has no
++                // samples and no picture in it, so dropping one cannot lose
++                // decodable data or desync the stream, and it cannot leak —
++                // av_packet_unref() runs on this path exactly as it does on
++                // the submit path below. End-of-stream is NOT affected: the
++                // drain is signalled by avcodec_send_packet(dec, NULL) in the
++                // branch above, never by a zero-size packet.
++                //
++                // The case that was actually observed is Theora's. The
++                // Ogg/Theora demuxer emits such packets for DUPLICATE frames,
++                // which Theora encodes as an empty payload meaning "keep
++                // showing the previous frame". They are common: 36 of the
++                // first ~400 video packets in the rerelease
++                // baseq2/video/ects.ogv are size 0, so the first dupe frame —
++                // a second or two in — killed EVERY .ogv cinematic. This is
++                // not iOS-specific; the macOS oracle built against Homebrew
++                // FFmpeg 7.x fails identically, so it is an upstream q2repro
++                // incompatibility with modern FFmpeg rather than a port defect.
++                //
++                // And for that case dropping is also the correct DISPLAY
++                // semantics: the engine keeps presenting the last decoded
++                // frame (R_UpdateRawPic is only called when a new one
++                // arrives), and the next real packet carries a PTS that
++                // already accounts for the repeated display time, so the
++                // naive timestamp-vs-realtime pacing below stays correct.
++                av_packet_unref(pkt);
++                continue;
+             } else {
+                 // submit the packet to the decoder
+                 ret = avcodec_send_packet(dec, pkt);
+--- a/src/client/sound/ogg.c
++++ b/src/client/sound/ogg.c
+@@ -312,7 +312,15 @@ static int read_packet(AVPacket *pkt)
+         int ret = av_read_frame(ogg.fmt_ctx, pkt);
+         if (ret < 0)
+             return ret;
+-        if (pkt->stream_index == ogg.stream_index)
++        // Skip empty payloads for the same reason cin.c does: since FFmpeg 6.1
++        // avcodec_send_packet() returns EINVAL, silently, for a packet with
++        // data but size 0, and decode_frame() below turns any negative return
++        // into "stop the music". Vorbis in Ogg is not known to emit them the
++        // way Theora does for duplicate frames, so this is insurance rather
++        // than an observed failure — but it is the same one-line class of bug,
++        // and a track that silently stops mid-level is exactly the kind of
++        // thing nobody would think to file.
++        if (pkt->stream_index == ogg.stream_index && pkt->size)
+             return ret;
+         av_packet_unref(pkt);
+     }

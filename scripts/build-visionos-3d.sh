@@ -29,7 +29,11 @@ restore_ios_project() {
   ( cd "$ROOT/app" && xcodegen generate >/dev/null 2>&1 ) || true
   echo "== restored default iOS project =="
 }
-trap restore_ios_project EXIT
+# The trap OWNS the exit status (PASSED / FAILED / INTERRUPTED) — see
+# scripts/lib/suite-trap.sh. It also runs the cleanup hook below on EVERY path.
+SUITE_NAME="build-visionos-3d"
+. "$ROOT/scripts/lib/suite-trap.sh"
+suite_cleanup_hook() { restore_ios_project; }
 
 echo "== generating visionOS-3D (immersive) project =="
 Q2_ANGLE=1 Q2_VISIONOS_3D=1 "$ROOT/scripts/gen-app-project.sh"

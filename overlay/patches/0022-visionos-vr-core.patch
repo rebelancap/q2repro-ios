@@ -1,0 +1,347 @@
+Subject: [overlay 0022] visionOS VR core — head pose, per-eye tangents, VR gates
+
+The whole engine-side delta for the visionOS VR mode, gated on a single state block
+(q2vr, inc/shared/shared.h) that ONLY a visionOS VR world frame ever sets. Every other
+configuration — iOS, the macOS oracle, the visionOS 2D window, the visionOS 3D panel —
+leaves it zero and takes byte-for-byte the paths it takes today.
+
+  * q2_vr_state_t + the global instance (shared.h, common/math.c). One struct, written by
+    the platform shell, read by the client and the renderer. Deliberately NOT cvars:
+    cl_kickangles, cl_thirdperson and gl_znear are CVAR_CHEAT and are silently refused on
+    a multiplayer server, so a VR override expressed as a cvar write would work in single
+    player and vanish online.
+  * Matrix_FrustumTangents (common/math.c) — the asymmetric per-eye projection, from the
+    compositor's four edge tangents in X *and* Y. GL_Frustum takes it under the VR gate,
+    with the near plane read from q2vr.znear and the far plane published back in
+    q2vr.zfar_used so the composite's forward-Z -> reverse-infinite conversion uses the
+    number this frame rendered with (it changes per map).
+  * The stereo-convergence window skew is skipped in VR: the tangents already encode the
+    eye offset, and skewing again double-counts it.
+  * GL_SetupFrustumTangents (refresh/main.c) — culling planes built from the real per-eye
+    tangents instead of half a symmetric FOV. This is the black-wedge-past-85-degrees
+    class; the eye frusta are asymmetric and canted, so the fov/2 cone rejects geometry
+    the eye can actually see.
+  * setup_weaponmodel renders the gun in the WORLD frustum in VR (cl_gunfov re-projection
+    is a flat-screen affordance that breaks stereo scale and lies about depth), and the
+    RF_DEPTHHACK depth-range squash is disabled — the compositor reprojects against depth,
+    and a squashed value makes the weapon swim against the world on every head movement.
+  * Head pose written as ordinary refdef viewangles + an origin OFFSET at the site overlay
+    0016 already owns (client/view.c). refdef_t carries Euler angles and the renderer
+    derives its basis from them, so this is the entire pose seam. The offset form keeps
+    prediction, the view-height ramp and the damage view drop working.
+  * Audio listener basis substituted for the head basis (client/entities.c) so sound
+    sources stay put in the room when the body turns under a still head.
+
+Apply: patch -p1 -d vendor/q2repro < this
+--- a/inc/shared/shared.h
++++ b/inc/shared/shared.h
+@@ -1257,7 +1257,41 @@
+ //ROGUE
+ 
+ #define RDF_TELEPORT_BIT    BIT(4)      // used by Q2PRO (extended servers)
++
++// [vr overlay] ---------------------------------------------------------------------
++// The whole VR delta, in ONE struct that the platform shell writes and the engine reads.
++// `active` is set only by a visionOS VR world frame; every other build (iOS, the macOS
++// oracle, the visionOS 2D window and 3D panel) leaves it zero and therefore takes byte-for-
++// byte the paths it takes today. Nothing here is a cvar: `cl_kickangles`, `cl_thirdperson`
++// and `gl_znear` are CVAR_CHEAT and are silently refused on a multiplayer server, so a VR
++// override expressed as a cvar write would work in single player and vanish online.
++//
++// Tangents are POSITIVE magnitudes of the per-eye frustum edges at unit distance, in the
++// compositor's own convention (x right, y up, z back): the frustum spans -tanL..+tanR
++// horizontally and -tanD..+tanU vertically. They come from the compositor per eye per frame
++// and are asymmetric in BOTH axes on real hardware.
++typedef struct {
++    int     active;             // 1 while a VR world frame is being set up/rendered
++    int     eye;                // 0 = left, 1 = right (diagnostics only)
++    float   tan_l, tan_r, tan_u, tan_d;   // this eye's frustum tangents
++    int     pose_valid;         // 0 = no head pose yet; the frame renders from the game view
++    int     yaw_relative;       // 1 = viewangles[YAW] is ADDED to the game's own view yaw
++    float   eyeofs[3];          // this eye's offset from the game view origin in HEAD-LOCAL
++                                // axes (forward, right, up), world units. The engine rotates
++                                // it by the finished view angles, which is the only place
++                                // those angles are known.
++    float   viewangles[3];      // head euler angles, degrees (pitch, yaw, roll); yaw is
++                                // relative to the game's view yaw when yaw_relative is set
++    float   vieworg[3];         // WRITTEN BY THE ENGINE: the origin the frame actually used
++    float   game_yaw;           // WRITTEN BY THE ENGINE: the game's own view yaw this frame
++    float   listener_axis[3][3];// forward/right/up for the audio listener, head-derived
++    int     listener_valid;
++    float   znear;              // VR near plane in world units (0 = use gl_znear)
++    float   zfar_used;          // WRITTEN BY THE ENGINE: the far plane the last frustum used
++} q2_vr_state_t;
+ 
++extern q2_vr_state_t q2vr;
++
+ //
+ // muzzle flashes / player effects
+ //
+--- a/inc/common/math.h
++++ b/inc/common/math.h
+@@ -74,6 +74,9 @@
+ void Matrix_TransformVec4(const vec4_t a, const mat4_t m, vec4_t out);
+ void Matrix_Multiply(const mat4_t a, const mat4_t b, mat4_t out);
+ void Matrix_Frustum(float fov_x, float fov_y, float reflect_x, float znear, float zfar, float *matrix);
++// [vr overlay] asymmetric per-eye variant, driven by the compositor's four edge tangents
++void Matrix_FrustumTangents(float tan_l, float tan_r, float tan_u, float tan_d,
++                            float reflect_x, float znear, float zfar, float *matrix);
+ void Matrix_FromOriginAxis(const vec3_t origin, const vec3_t axis[3], mat4_t out);
+ 
+ // quaternion routines, for MD5 skeletons
+--- a/src/common/math.c
++++ b/src/common/math.c
+@@ -144,6 +144,49 @@
+     out[15] = b0 * a03 + b1 * a13 + b2 * a23 + b3 * a33;
+ }
+ 
++// [vr overlay] The one VR state block. Defined here because common/math.c links into every
++// configuration (client, refresh, server, the macOS oracle), so client-side writers and
++// renderer-side readers share one instance without a new translation unit or meson entry.
++// Zero on every build that is not a visionOS VR world frame.
++q2_vr_state_t q2vr;
++
++// [vr overlay] Generalised frustum: the four edge TANGENTS instead of a symmetric fov pair.
++// Identical output to Matrix_Frustum when l == r == tan(fov_x/2) and u == d == tan(fov_y/2),
++// which is asserted by the VR contract dump rather than assumed. The off-centre slots
++// matrix[8] and matrix[9] have existed in this function forever and have always evaluated to
++// zero; VR is the first caller that makes them non-zero, so any downstream helper that
++// "knows" they are zero is a bug the moment VR runs (the donors lost a round to exactly that
++// class of half-correct Y flip). Nothing downstream of here in this engine touches them.
++void Matrix_FrustumTangents(float tan_l, float tan_r, float tan_u, float tan_d,
++                            float reflect_x, float znear, float zfar, float *matrix)
++{
++    float xmin = -tan_l * znear, xmax = tan_r * znear;
++    float ymin = -tan_d * znear, ymax = tan_u * znear;
++    float width = xmax - xmin;
++    float height = ymax - ymin;
++    float depth = zfar - znear;
++
++    matrix[0] = reflect_x * 2 * znear / width;
++    matrix[4] = 0;
++    matrix[8] = (xmax + xmin) / width;
++    matrix[12] = 0;
++
++    matrix[1] = 0;
++    matrix[5] = 2 * znear / height;
++    matrix[9] = (ymax + ymin) / height;
++    matrix[13] = 0;
++
++    matrix[2] = 0;
++    matrix[6] = 0;
++    matrix[10] = -(zfar + znear) / depth;
++    matrix[14] = -2 * zfar * znear / depth;
++
++    matrix[3] = 0;
++    matrix[7] = 0;
++    matrix[11] = -1;
++    matrix[15] = 0;
++}
++
+ void Matrix_Frustum(float fov_x, float fov_y, float reflect_x, float znear, float zfar, float *matrix)
+ {
+     float xmin, xmax, ymin, ymax;
+--- a/src/refresh/state.c
++++ b/src/refresh/state.c
+@@ -236,6 +236,23 @@
+     else
+         zfar = gl_static.world.size * 2;
+ 
++    // [vr overlay] In VR the projection comes from the compositor's per-eye tangents, which
++    // are asymmetric in X *and* Y — the stereo overlay's single-offset X skew below cannot
++    // express that, and stacking the two would double-count the eye offset. The near plane
++    // is taken engine-side from q2vr.znear rather than by writing gl_znear, which is
++    // CVAR_CHEAT and silently refused on any multiplayer server. zfar is published back so
++    // the composite's forward-Z -> reverse-infinite conversion uses the number this frame
++    // actually rendered with, not a number the shell guessed (it changes per map).
++    if (q2vr.active) {
++        if (q2vr.znear > 0)
++            znear = q2vr.znear;
++        q2vr.zfar_used = zfar;
++        Matrix_FrustumTangents(q2vr.tan_l, q2vr.tan_r, q2vr.tan_u, q2vr.tan_d,
++                               reflect_x, znear, zfar, matrix);
++        gl_backend->load_matrix(GL_PROJECTION, matrix, gl_identity);
++        return;
++    }
++
+     Matrix_Frustum(fov_x, fov_y, reflect_x, znear, zfar, matrix);
+ 
+     // [stereo overlay] Off-axis convergence: the stereo eye offset shifts vieworg along
+--- a/src/refresh/main.c
++++ b/src/refresh/main.c
+@@ -100,12 +100,55 @@
+ 
+ // ==============================================================================
+ 
++// [vr overlay] Culling planes from this eye's real tangents instead of half of a symmetric
++// FOV. The symmetric build is not merely imprecise in VR, it is WRONG: a Vision Pro eye
++// frustum is asymmetric and canted, and geometry the eye can see falls outside the
++// fov/2 cone — which is the hard black wedge past roughly 85 degrees that the donors
++// catalogued. Same planes, same consumers (GL_CullBox/Sphere/LocalBox and the BSP node
++// rejection in world.c); only their construction changes.
++//
++// Derivation: the right edge direction is F - L*tan_r (F forward, L left, U up), so the
++// right plane's inward normal is F*tan_r + L, normalised. The other three follow by sign.
++// With tan_l == tan_r == tan(fov_x/2) this reproduces the symmetric planes exactly.
++static void GL_SetupFrustumTangents(void)
++{
++    vec3_t forward;
++    cplane_t *p;
++    int i;
++    const float tl = q2vr.tan_l, tr = q2vr.tan_r, tu = q2vr.tan_u, td = q2vr.tan_d;
++
++    VectorScale(glr.viewaxis[0], tr, forward);
++    VectorAdd(forward, glr.viewaxis[1], glr.frustumPlanes[0].normal);
++
++    VectorScale(glr.viewaxis[0], tl, forward);
++    VectorSubtract(forward, glr.viewaxis[1], glr.frustumPlanes[1].normal);
++
++    VectorScale(glr.viewaxis[0], td, forward);
++    VectorAdd(forward, glr.viewaxis[2], glr.frustumPlanes[2].normal);
++
++    VectorScale(glr.viewaxis[0], tu, forward);
++    VectorSubtract(forward, glr.viewaxis[2], glr.frustumPlanes[3].normal);
++
++    for (i = 0, p = glr.frustumPlanes; i < 4; i++, p++) {
++        VectorNormalize(p->normal);
++        p->dist = DotProduct(glr.fd.vieworg, p->normal);
++        p->type = PLANE_NON_AXIAL;
++        SetPlaneSignbits(p);
++    }
++}
++
+ static void GL_SetupFrustum(void)
+ {
+     vec_t angle, sf, cf;
+     vec3_t forward, left, up;
+     cplane_t *p;
+     int i;
++
++    // [vr overlay] asymmetric per-eye frustum (see above)
++    if (q2vr.active && (q2vr.tan_l > 0 || q2vr.tan_r > 0)) {
++        GL_SetupFrustumTangents();
++        return;
++    }
+ 
+     // right/left
+     angle = DEG2RAD(glr.fd.fov_x / 2);
+--- a/src/refresh/mesh.c
++++ b/src/refresh/mesh.c
+@@ -941,6 +941,20 @@
+     float fov_y = glr.fd.fov_y;
+     float reflect_x = 1.0f;
+ 
++    // [vr overlay] cl_gunfov re-projects the gun through a narrower frustum than the world.
++    // In stereo that is not a cosmetic difference: the weapon would sit at a different
++    // apparent scale and disparity than everything around it, and its depth would be
++    // metrically meaningless to the compositor's reprojection. In VR the gun renders in the
++    // WORLD frustum, mirroring only for the left-handed setting.
++    if (q2vr.active) {
++        if ((info_hand->integer == 1 && cl_gun->integer == 1) || cl_gun->integer == 3) {
++            reflect_x = -1.0f;
++            qglFrontFace(GL_CCW);
++        }
++        GL_Frustum(glr.fd.fov_x, glr.fd.fov_y, reflect_x);
++        return;
++    }
++
+     if (cl_gunfov->value > 0) {
+         fov_x = Cvar_ClampValue(cl_gunfov, 30, 160);
+         if (cl_adjustfov->integer) {
+@@ -1099,7 +1113,12 @@
+     if (ent->flags & RF_WEAPONMODEL)
+         setup_weaponmodel();
+ 
+-    if (ent->flags & RF_DEPTHHACK)
++    // [vr overlay] The RF_DEPTHHACK range squash crushes the view weapon into the nearest
++    // quarter of the depth buffer so it cannot poke through walls. The value it writes is
++    // metrically meaningless, and in VR the compositor REPROJECTS against that value — the
++    // gun would swim against the world on every head movement. Disabled under the VR gate;
++    // the gun renders with honest depth in the world frustum (see setup_weaponmodel).
++    if ((ent->flags & RF_DEPTHHACK) && !q2vr.active)
+         GL_DepthRange(0, 0.25f);
+ 
+     // set up lights
+@@ -1122,7 +1141,7 @@
+                         mesh->skins, mesh->numskins);
+     }
+ 
+-    if (ent->flags & RF_DEPTHHACK)
++    if ((ent->flags & RF_DEPTHHACK) && !q2vr.active)
+         GL_DepthRange(0, 1);
+ 
+     if (ent->flags & RF_WEAPONMODEL) {
+--- a/src/client/view.c
++++ b/src/client/view.c
+@@ -595,10 +595,41 @@
+         cl.refdef.vieworg[1] += 1.0f / 16;
+         cl.refdef.vieworg[2] += 1.0f / 16;
+ 
+-        // [stereo overlay] shift the eye sideways for stereoscopic 3D (parallel cameras — same
+-        // view angles, so no vertical parallax). cl.v_right is set by CL_AddEntities above.
+-        if (cl_stereo_offset)
++        // [vr overlay] The whole head-pose injection, at the site the stereo overlay already
++        // owns. refdef_t carries EULER viewangles and the renderer derives its basis from
++        // them (AnglesToAxis in GL_RotateForViewer), so writing angles + origin here is the
++        // complete pose seam — no view-matrix plumbing anywhere. The shell has already
++        // composed body yaw, head orientation and this eye's offset into one pose, so the
++        // stereo overlay's own sideways shift must NOT also run (it would double the IPD).
++        //
++        // cl.v_forward/right/up keep the GAME basis on purpose: the viewmodel and the
++        // damage-direction indicator are placed in it, and the audio listener is substituted
++        // separately and deliberately (entities.c), so which consumer sees which basis is a
++        // decision recorded per consumer rather than a side effect of the order of writes.
++        //
++        // The origin is composed as an OFFSET from the game view origin rather than
++        // replaced outright: prediction, the 100 ms view-height ramp and the damage view
++        // drop all live in that origin and must keep working, and the height-calibration
++        // work of a later round is then a single term in eyeofs[2] instead of a second
++        // place that has to re-derive everything the engine already computed.
++        if (q2vr.active && q2vr.pose_valid) {
++            vec3_t vrang, vrf, vrr, vru;
++            q2vr.game_yaw = cl.refdef.viewangles[YAW];
++            vrang[PITCH] = q2vr.viewangles[PITCH];
++            vrang[YAW]   = q2vr.viewangles[YAW] +
++                           (q2vr.yaw_relative ? cl.refdef.viewangles[YAW] : 0.0f);
++            vrang[ROLL]  = q2vr.viewangles[ROLL];
++            AngleVectors(vrang, vrf, vrr, vru);
++            VectorMA(cl.refdef.vieworg, q2vr.eyeofs[0], vrf, cl.refdef.vieworg);
++            VectorMA(cl.refdef.vieworg, q2vr.eyeofs[1], vrr, cl.refdef.vieworg);
++            VectorMA(cl.refdef.vieworg, q2vr.eyeofs[2], vru, cl.refdef.vieworg);
++            VectorCopy(vrang, cl.refdef.viewangles);
++            VectorCopy(cl.refdef.vieworg, q2vr.vieworg);   // identity, not intent: what was used
++        } else if (cl_stereo_offset) {
++            // [stereo overlay] shift the eye sideways for stereoscopic 3D (parallel cameras — same
++            // view angles, so no vertical parallax). cl.v_right is set by CL_AddEntities above.
+             VectorMA(cl.refdef.vieworg, cl_stereo_offset, cl.v_right, cl.refdef.vieworg);
++        }
+ 
+         cl.refdef.x = scr.vrect.x;
+         cl.refdef.y = scr.vrect.y;
+--- a/src/client/entities.c
++++ b/src/client/entities.c
+@@ -1609,9 +1609,21 @@
+     cl.refdef.vieworg[2] += viewheight;
+ 
+     VectorCopy(cl.refdef.vieworg, listener_origin);
+-    VectorCopy(cl.v_forward, listener_forward);
+-    VectorCopy(cl.v_right, listener_right);
+-    VectorCopy(cl.v_up, listener_up);
++    // [vr overlay] In VR the player's ears turn with their head, not with the body yaw the
++    // game reports. The CoreAudio DMA backend pans from DotProduct(listener_right, dir)
++    // only (no elevation, no HRTF), so this substitution is exactly the yaw-following the
++    // backend can express — and it is the difference between sound sources staying put in
++    // the room and sweeping across the head whenever the body turns under a still head.
++    // listener_origin keeps the view origin, which the shell has already put at the head.
++    if (q2vr.active && q2vr.listener_valid) {
++        VectorCopy(q2vr.listener_axis[0], listener_forward);
++        VectorCopy(q2vr.listener_axis[1], listener_right);
++        VectorCopy(q2vr.listener_axis[2], listener_up);
++    } else {
++        VectorCopy(cl.v_forward, listener_forward);
++        VectorCopy(cl.v_right, listener_right);
++        VectorCopy(cl.v_up, listener_up);
++    }
+ }
+ 
+ /*

@@ -7,7 +7,11 @@
 #
 #   scripts/sim-validate-visionos.sh [2d|3d|both]     # default: both
 #
-# Sim: "q2repro-vision" (Apple Vision Pro, visionOS 26.5), UDID below — THIS repo's own.
+# Sim: the ONE program-shared "Apple Vision Pro" (visionOS 27.0). The old per-repo
+# "q2repro-vision" device (visionOS 26.5) no longer exists, which settles the runtime
+# question SHELL-GAPS item 10 / QUESTIONS Q-VR4 raised: 27.0 is now the only option
+# and it matches the program rule. There is exactly one of these — check `simctl list
+# devices booted` before claiming it, and never create a second.
 # Prereqs (one command each): build-angle-visionos.sh + stage to angle-prebuilt-visionos-sim
 # (xrsimulator slice), build-ffmpeg-visionos.sh simulator, build-curl-visionos.sh simulator.
 #
@@ -18,7 +22,7 @@
 #        (exercises overlay 0018 world-render guard — the Enter-3D assertion fix).
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-UDID="30F5DAA4-0412-4C2E-B9B2-FEA70E1316AF"
+UDID="9D4499E9-CCED-4AF1-9303-925E9515D346"
 OUTDIR="$ROOT/artifacts/sim"
 GITREV="$(git -C "$ROOT" rev-parse --short HEAD)"
 WHICH="${1:-both}"
@@ -28,7 +32,22 @@ restore_ios_project() {
   ( cd "$ROOT/app" && xcodegen generate >/dev/null 2>&1 ) || true
   echo "== restored default iOS project =="
 }
-trap restore_ios_project EXIT
+# The trap OWNS the exit status (PASSED / FAILED / INTERRUPTED) — see
+# scripts/lib/suite-trap.sh. It also runs the cleanup hook below on EVERY path.
+SUITE_NAME="sim-validate-visionos"
+. "$ROOT/scripts/lib/suite-trap.sh"
+suite_cleanup_hook() {
+  restore_ios_project
+  # Lane discipline, always — pass, fail, or signal. OWN_LANE guards the polite case:
+  # a run that aborted because another session already had the headset booted must not
+  # tear down the lane it was being polite to.
+  if [ "${OWN_LANE:-0}" = 1 ]; then
+    xcrun simctl terminate "$UDID" com.rebelancap.q2repro 2>/dev/null || true
+    xcrun simctl terminate "$UDID" com.rebelancap.q2repro3d 2>/dev/null || true
+    xcrun simctl shutdown "$UDID" 2>/dev/null || true
+    echo "== released visionOS lane $UDID =="
+  fi
+}
 mkdir -p "$OUTDIR"
 
 build_install() {
@@ -61,7 +80,15 @@ seed_vanilla() { # $1 = bundle, $2 = 1 to also add rerelease video/kpf
 }
 
 echo "== boot $UDID =="
-xcrun simctl bootstatus "$UDID" -b
+# There is exactly ONE visionOS simulator in the program. If somebody else already has it,
+# do not fight them for it — and do not claim the lane, so the cleanup hook leaves it alone.
+if xcrun simctl list devices booted | grep -q "$UDID"; then
+  echo "NOTE: $UDID is already booted — reusing it, and NOT shutting it down at the end."
+else
+  sim_wait_shutdown "$UDID" || die "$UDID never reached state=Shutdown"
+  xcrun simctl bootstatus "$UDID" -b
+  OWN_LANE=1
+fi
 
 if [ "$WHICH" = 2d ] || [ "$WHICH" = both ]; then
   build_install "2D" "Q2_VISIONOS=1" com.rebelancap.q2repro "" >/dev/null
@@ -74,11 +101,13 @@ if [ "$WHICH" = 2d ] || [ "$WHICH" = both ]; then
   xcrun simctl io "$UDID" screenshot "$OUTDIR/vp2d-$GITREV.png" >/dev/null 2>&1 || true
   echo "-- [2D] verdict --"
   if grep -q "Couldn't init demo context" "$LOG" 2>/dev/null; then
-    echo "FAIL: PROTOCOL_NOT_SUPPORTED still kills the demo"; grep "demo context" "$LOG" | tail -1; exit 1
+    fail "PROTOCOL_NOT_SUPPORTED still kills the demo"; grep "demo context" "$LOG" | tail -1
   elif grep -q 'Old-protocol demo: playing without seek snapshots' "$LOG" 2>/dev/null; then
-    echo "PASS: old-protocol demo plays without snapshots (overlay 0017)"; grep 'Old-protocol' "$LOG" | tail -1
+    pass "old-protocol demo plays without snapshots (overlay 0017)"; grep 'Old-protocol' "$LOG" | tail -1
   else
-    echo "INCONCLUSIVE: neither marker in $LOG — inspect it"; tail -6 "$LOG" 2>/dev/null
+    # Not a pass. "We could not tell" used to exit 0 here, which is the whole reason the
+    # trap exists — inconclusive() counts as a failure.
+    inconclusive "neither demo marker in $LOG"; tail -6 "$LOG" 2>/dev/null
   fi
 fi
 
@@ -95,13 +124,15 @@ if [ "$WHICH" = 3d ] || [ "$WHICH" = both ]; then
   ALIVE=$(ps aux | grep -c '[q]2repro.app/q2repro')
   echo "-- [3D] verdict --"
   if grep -qi 'R_RenderFrame.*assert\|FATAL: R_RenderFrame' "$LOG3" 2>/dev/null; then
-    echo "FAIL: R_RenderFrame assertion still fires"; grep -i 'assert' "$LOG3" | tail -1; exit 1
+    fail "R_RenderFrame assertion still fires"; grep -i 'assert' "$LOG3" | tail -1
   elif grep -q 'Outer Base' "$LOG3" 2>/dev/null && [ "$ALIVE" != 0 ]; then
-    echo "PASS: base1 loaded, immersive space rendering, no assertion (overlay 0018). alive=$ALIVE"
+    pass "base1 loaded, immersive space rendering, no assertion (overlay 0018). alive=$ALIVE"
   else
-    echo "INCONCLUSIVE: base1='$(grep -c 'Outer Base' "$LOG3" 2>/dev/null)' alive=$ALIVE — inspect $LOG3"; tail -8 "$LOG3" 2>/dev/null
+    inconclusive "base1='$(grep -c 'Outer Base' "$LOG3" 2>/dev/null)' alive=$ALIVE — inspect $LOG3"; tail -8 "$LOG3" 2>/dev/null
   fi
   echo "NOTE: the visionOS sim can't screenshot immersive content — stereo visual is a device check (QUESTIONS.md)."
 fi
 echo ""
-echo "DONE — logs are the proof here (sim can't capture immersive frames). See $OUTDIR/vp*.png for the 2D windows."
+echo "See $OUTDIR/vp*.png for the 2D windows; immersive frames are proved by the engine-side"
+echo "composite readback assertions, not by window grabs (the sim cannot capture them)."
+# NOTE: no explicit exit — the EXIT trap owns the verdict (PASSED / FAILED / INTERRUPTED).

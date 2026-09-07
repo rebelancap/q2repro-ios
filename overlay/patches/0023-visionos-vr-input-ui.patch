@@ -1,0 +1,325 @@
+Subject: [overlay 0023] visionOS VR — gamepad aim/turn, the alignment chain, the 2D redirect
+
+The R2 engine delta, gated on the same q2vr state block overlay 0022 introduced, so every
+other configuration — iOS, the macOS oracle, the visionOS 2D window, the visionOS 3D panel —
+leaves it zero and takes byte-for-byte the paths it takes today.
+
+  * q2_vr_state_t gains an APPENDED R2 section (shared.h): the absolute aim source, the
+    movement-direction rotation, the standing-height rise and its clamp result, the two
+    values the client publishes back, and the 2D-redirect gate. Appended and not inserted:
+    the shell and the engine are separate translation units that agree only by layout.
+
+  * ABSOLUTE AIM (client/input.c, CL_UpdateCmd). cl.viewangles is what the client SENDS;
+    the VR camera comes from the published head pose, so writing the head's angles here
+    gives stock progs, mods, the campaign and multiplayer ordinary view angles with no
+    protocol change. ASSIGNED, never accumulated — cl_ios_look_delta is a delta accumulator
+    that composes with touch and gyro. Placed before CL_ClampPitch so the SENT pitch still
+    gets the engine's +-89 clamp while the RENDER pitch stays the head's true one, and
+    outside CL_AdjustAngles because that function early-returns while the weapon wheel is
+    open (which would leave aim dead exactly while the player is choosing a weapon).
+    cl.viewangles is published back as q2vr.view_yaw_out/view_pitch_out so the shell can
+    seed its body yaw from the game's own facing rather than from 0.
+
+  * MOVEMENT DIRECTION (client/input.c, CL_FinalizeCmd) — the FINISHED wish vector rotated
+    after every device has contributed and after the speed clamp. Two lines of trig, no
+    protocol change. The sign of the side term is not the textbook rotation: the server
+    builds velocity as F*forwardmove + R*sidemove with R 90 degrees CLOCKWISE of F.
+
+  * STANDING HEIGHT + CEILING CLAMP (client/view.c, client/entities.c). The rise is applied
+    in WORLD Z, not along the head's own up axis — a player's stature does not tilt when
+    they tilt their head. CL_VR_ClampRise traces up with the existing CL_LerpedTrace and
+    clamps asymmetrically: DUCK INSTANTLY (a frame rendered from inside a brush is a visible
+    defect), RISE BACK EASED at ~40 u/s (a camera that snaps upward is the one motion the
+    head did not ask for). Eased once per host FRAME, not once per eye.
+
+  * THE VR YAW COMPOSITION, corrected (client/view.c is unchanged here; the shell now
+    contributes zero head yaw while aim is live). Documented in q2_vr_input.m: the head yaw
+    goes OUT through cl.viewangles and comes BACK through cl.predicted_angles, so adding it
+    at the render site as well would double every head turn — and reading the game's own
+    view yaw is what makes teleports and spawn re-orientation rotate the camera too.
+
+  * THE 2D REDIRECT (client/screen.c) — the whole 2D stream (HUD, UI_Draw, console, notify,
+    loading plaque, and the weapon wheel's own capture, which rides SCR_Draw2D) is drawn
+    ONCE per host frame into a UI framebuffer instead of into the eye image. Two bind/unbind
+    brackets rather than one, because V_RenderView sits between the HUD half and the
+    menu/console half and the WORLD must land in the eye target. The hooks are function
+    POINTERS in q2vr, not extern functions, so no configuration without a platform shell
+    (the macOS oracle, the meson build) needs a stub to link.
+
+    NOT redirected, deliberately: the pre-world 2D siblings inside SCR_DrawActive (the black
+    fill for a non-active client, the cinematic blit, SCR_TileClear). Every one belongs to a
+    frame arbitration has already sent to the PANEL — a VR world frame is ca_active,
+    non-cinematic and runs at viewsize 100 — so redirecting them would move nothing and put
+    a bind/unbind pair on the world path for no reason.
+
+Apply: patch -p1 -d vendor/q2repro < this
+--- a/inc/shared/shared.h
++++ b/inc/shared/shared.h
+@@ -1288,6 +1288,31 @@
+     int     listener_valid;
+     float   znear;              // VR near plane in world units (0 = use gl_znear)
+     float   zfar_used;          // WRITTEN BY THE ENGINE: the far plane the last frustum used
++
++    // [vr overlay R2] input + alignment + the 2D redirect. APPENDED, never inserted: a field
++    // added in the middle of this struct changes the offset of every field after it, and the
++    // shell and the engine are separate translation units that only agree by layout.
++    int     aim_valid;          // 1 = the shell owns cl.viewangles this frame (absolute aim)
++    float   aim_angles[3];      // what to SEND: pitch/yaw/roll degrees, absolute
++    int     move_rotate;        // 1 = rotate the finished wish vector by move_yaw
++    float   move_yaw;           // degrees, CCW, applied to (forwardmove, sidemove)
++    float   move_out[2];        // WRITTEN BY THE ENGINE: the finished move after rotation
++    float   view_yaw_out;       // WRITTEN BY THE ENGINE: cl.viewangles[YAW] after the client
++    float   view_pitch_out;     // WRITTEN BY THE ENGINE: cl.viewangles[PITCH] after the client
++    int     ceiling_clamp;      // 1 = trace-clamp the raised camera against the ceiling
++    float   rise;               // desired vertical rise above the game eye, world units
++    float   rise_applied;       // WRITTEN BY THE ENGINE: the rise after the ceiling clamp
++    int     rise_ducked;        // WRITTEN BY THE ENGINE: 1 while the clamp is holding us down
++
++    // The 2D redirect (charter D6). `ui_redirect` says the whole 2D stream belongs on the UI
++    // texture rather than in the eye image; `ui_draw` says THIS pass is the one that draws it
++    // (eye 0 only — a second draw would be the same pixels twice). The two hooks are function
++    // POINTERS installed by the platform shell, not extern functions, so no configuration that
++    // has no shell (the macOS oracle, the meson build) needs a stub to link.
++    int     ui_redirect;
++    int     ui_draw;
++    void  (*ui_begin)(void);    // bind the UI framebuffer (and clear it once per host frame)
++    void  (*ui_end)(void);      // bind back to the eye framebuffer
+ } q2_vr_state_t;
+ 
+ extern q2_vr_state_t q2vr;
+--- a/src/client/client.h
++++ b/src/client/client.h
+@@ -892,6 +892,9 @@
+ 
+ void CL_DeltaFrame(void);
+ void CL_AddEntities(void);
++// [vr overlay R2] ceiling clamp for the raised VR camera (see entities.c). Returns the
++// vertical rise actually allowed this frame, ducking instantly and rising back eased.
++float CL_VR_ClampRise(const vec3_t org, float want);
+ void CL_CalcViewValues(void);
+ 
+ #if USE_DEBUG
+--- a/src/client/input.c
++++ b/src/client/input.c
+@@ -748,8 +748,35 @@
+ 
+     // clamp to server defined max speed
+     CL_ClampSpeed(cl.localmove);
++
++    // [vr overlay R2] The absolute VR aim source. `cl.viewangles` is what the client SENDS;
++    // the VR camera does not come from it (the head pose is composed at the view.c site), so
++    // writing the head's angles here makes stock progs, every mod, the campaign and
++    // multiplayer all see ordinary view angles with NO protocol change (guide 12.7).
++    //
++    // ASSIGNED, never accumulated: `cl_ios_look_delta` is a delta accumulator that composes
++    // with touch and gyro, and an absolute source routed through it would fight them. It
++    // lands here rather than inside CL_AdjustAngles because the weapon wheel early-returns
++    // from that function while it is open, which would leave aim dead exactly while the
++    // player is choosing a weapon.
++    //
++    // Placed BEFORE CL_ClampPitch on purpose: the sent pitch still gets the engine's +-89
++    // clamp (a 90-degree-down look must not wrap the player), while the RENDER pitch stays
++    // the head's true one. Roll is never sent - a rolled usercmd is not a thing Q2 has.
++    if (q2vr.active && q2vr.aim_valid) {
++        cl.viewangles[PITCH] = q2vr.aim_angles[PITCH];
++        cl.viewangles[YAW]   = q2vr.aim_angles[YAW];
++        cl.viewangles[ROLL]  = 0.0f;
++    }
+ 
+     CL_ClampPitch();
++
++    // [vr overlay R2] Identity, not intent: what the client ACTUALLY ended up sending, after
++    // its own clamp. The shell seeds its body yaw from this at VR entry (never from 0, or the
++    // player is dropped into the level staring at a wall) and re-seeds from it whenever the
++    // engine slams the angles from under it.
++    q2vr.view_yaw_out   = cl.viewangles[YAW];
++    q2vr.view_pitch_out = cl.viewangles[PITCH];
+ 
+     cl.cmd.angles[0] = cl.viewangles[0];
+     cl.cmd.angles[1] = cl.viewangles[1];
+@@ -919,6 +946,31 @@
+     // clamp to server defined max speed
+     CL_ClampSpeed(move);
+ 
++    // [vr overlay R2] MOVEMENT DIRECTION. Rotate the FINISHED wish vector, here, after every
++    // device has contributed and after the speed clamp -- two lines of trig, no protocol
++    // change, and the one seam where "which way is forward" can be answered once for stick,
++    // touch and (in the next round) a tracked hand alike (guide 12.7).
++    //
++    // In the default Head mode this rotation is ZERO by construction, because the angles the
++    // client sends are already the head's: forward is where you look. The term exists for the
++    // modes that decouple them (body-relative now, aim-hand and off-hand next round), and it
++    // is those that make the mechanism assertable at all.
++    if (q2vr.active && q2vr.move_rotate && (move[0] || move[1])) {
++        float c = cosf(DEG2RAD(q2vr.move_yaw));
++        float s = sinf(DEG2RAD(q2vr.move_yaw));
++        // move_yaw is (desired movement yaw - the yaw being sent). The server builds the
++        // velocity as F(sent)*forwardmove + R(sent)*sidemove with R 90 degrees CLOCKWISE of
++        // F, so re-expressing F(sent+dy)*f + R(sent+dy)*s in the sent basis gives these two
++        // lines and NOT the textbook rotation -- the sign of the side term is the trap.
++        float f = move[0], sd = move[1];
++        move[0] =  f * c + sd * s;
++        move[1] = -f * s + sd * c;
++    }
++    if (q2vr.active) {
++        q2vr.move_out[0] = move[0];
++        q2vr.move_out[1] = move[1];
++    }
++
+     // store the movement vector
+     cl.cmd.forwardmove = move[0];
+     cl.cmd.sidemove = move[1];
+--- a/src/client/view.c
++++ b/src/client/view.c
+@@ -623,6 +623,13 @@
+             VectorMA(cl.refdef.vieworg, q2vr.eyeofs[0], vrf, cl.refdef.vieworg);
+             VectorMA(cl.refdef.vieworg, q2vr.eyeofs[1], vrr, cl.refdef.vieworg);
+             VectorMA(cl.refdef.vieworg, q2vr.eyeofs[2], vru, cl.refdef.vieworg);
++            // [vr overlay R2] STANDING HEIGHT, in WORLD Z and not along the head's own up
++            // axis: the player's stature does not tilt when they tilt their head. The value
++            // is a DEVIATION from the engine's own 46-unit eye constant (the shell computes
++            // it), trace-clamped against the ceiling here because this is the only place that
++            // has both the finished view origin and the client's collision model.
++            if (q2vr.rise != 0.0f || q2vr.rise_applied != 0.0f)
++                cl.refdef.vieworg[2] += CL_VR_ClampRise(cl.refdef.vieworg, q2vr.rise);
+             VectorCopy(vrang, cl.refdef.viewangles);
+             VectorCopy(cl.refdef.vieworg, q2vr.vieworg);   // identity, not intent: what was used
+         } else if (cl_stereo_offset) {
+--- a/src/client/entities.c
++++ b/src/client/entities.c
+@@ -1398,7 +1398,69 @@
+                                contentmask, org, ang, cl.csr.extended);
+ 
+         CM_ClipEntity(tr, &trace, (struct edict_s *)ent);
++    }
++}
++
++// [vr overlay R2] CEILING CLAMP for the raised VR camera.
++//
++// A player whose real eyes are above Quake's 46-unit eye constant renders from a camera that
++// sits ABOVE the player hull's own head (hull max z = 32), so a low corridor puts the eye
++// inside a brush and the world renders from inside solid. Trace up each frame and clamp.
++//
++// The asymmetry is the whole point (guide 12.5): DUCK INSTANTLY, because a single frame
++// rendered from inside a wall is a visible defect; RISE BACK EASED at ~40 u/s, because a
++// camera that snaps upward is the one motion the head did not ask for.
++//
++// Called once per EYE but eased once per host FRAME: q2vr.eye is 0 for the left eye, and
++// advancing the ease twice per frame would double the rise rate on a whim of the render loop.
++#define VR_RISE_SPEED   40.0f       // units per second, upward only
++float CL_VR_ClampRise(const vec3_t org, float want)
++{
++    static float applied;
++    static unsigned last_ms;
++    vec3_t start, end, mins, maxs;
++    trace_t tr;
++    float allowed = want;
++
++    // A player SHORTER than the engine's 46-unit eye lowers the camera, and lowering can
++    // never put it inside the ceiling. Pass it straight through, unclamped and un-eased:
++    // there is nothing to trace against and nothing to ease towards.
++    if (want <= 0.0f) {
++        q2vr.rise_applied = want;
++        q2vr.rise_ducked = 0;
++        return want;
++    }
++
++    if (q2vr.ceiling_clamp && cl.bsp && cl.bsp->nodes && want > 0.0f) {
++        // A point trace with a small box, from the un-raised eye straight up. The player's
++        // own hull is not used: this is the CAMERA's clearance, and the camera is a point the
++        // player can put wherever their neck reaches.
++        VectorSet(mins, -2, -2, 0);
++        VectorSet(maxs,  2,  2, 0);
++        VectorCopy(org, start);
++        VectorCopy(org, end);
++        end[2] += want;
++        CL_LerpedTrace(&tr, start, end, mins, maxs, MASK_SOLID);
++        allowed = want * tr.fraction;
++        if (allowed < 0.0f)
++            allowed = 0.0f;
++    }
++
++    if (q2vr.eye == 0) {
++        unsigned now = cls.realtime;
++        float dt = last_ms ? (now - last_ms) * 0.001f : 0.0f;
++        last_ms = now;
++        if (dt < 0.0f || dt > 0.25f)
++            dt = 0.0f;                      // a load hitch is not a second of rising
++        if (allowed <= applied)
++            applied = allowed;              // duck: instantly
++        else
++            applied = min(allowed, applied + VR_RISE_SPEED * dt);   // rise: eased
+     }
++
++    q2vr.rise_applied = applied;
++    q2vr.rise_ducked = (applied < want - 0.01f);
++    return applied;
+ }
+ 
+ /*
+--- a/src/client/screen.c
++++ b/src/client/screen.c
+@@ -2072,6 +2072,19 @@
+ 
+     // draw 3D game view
+     V_RenderView();
++
++    // [vr overlay R2] The HUD half of the 2D redirect (charter D6). The world has just been
++    // drawn into the EYE target; everything from here on is 2D and belongs on the UI texture,
++    // so the eye image carries ZERO 2D and the compositor can put the HUD on a quad at a
++    // real distance with real depth instead of pasting it onto the horizon.
++    if (q2vr.active && q2vr.ui_redirect && q2vr.ui_begin) {
++        if (q2vr.ui_draw) {         // eye 0 only: the same pixels twice is not a second view
++            q2vr.ui_begin();
++            SCR_Draw2D();
++            q2vr.ui_end();
++        }
++        return;
++    }
+ 
+     // draw all 2D elements
+     SCR_Draw2D();
+@@ -2118,15 +2131,36 @@
+     // do 3D refresh drawing
+     SCR_DrawActive();
+ 
+-    // draw main menu
+-    UI_Draw(cls.realtime);
+-
+-    // draw console
+-    Con_DrawConsole();
++    // [vr overlay R2] The rest of the 2D stream — menus, console, notify and the loading
++    // plaque. SCR_DrawActive brackets its own SCR_Draw2D above (it cannot be inside this
++    // bracket: V_RenderView is in there and the WORLD must land in the eye target), so this
++    // is the second half of the same redirect, and the UI target is cleared once per host
++    // frame by the shell rather than once per bracket.
++    //
++    // Not redirected here on purpose: the pre-world 2D siblings inside SCR_DrawActive (the
++    // black fill for a non-active client, the cinematic blit and SCR_TileClear). Every one of
++    // them belongs to a frame that arbitration has already sent to the PANEL — a VR world
++    // frame is ca_active, non-cinematic and runs at viewsize 100 — so redirecting them would
++    // move nothing and would put a bind/unbind pair on the world path for no reason.
++    if (q2vr.active && q2vr.ui_redirect && q2vr.ui_begin) {
++        if (q2vr.ui_draw) {
++            q2vr.ui_begin();
++            UI_Draw(cls.realtime);
++            Con_DrawConsole();
++            SCR_DrawLoading();
++            q2vr.ui_end();
++        }
++    } else {
++        // draw main menu
++        UI_Draw(cls.realtime);
+ 
+-    // draw loading plaque
+-    SCR_DrawLoading();
++        // draw console
++        Con_DrawConsole();
+ 
++        // draw loading plaque
++        SCR_DrawLoading();
++    }
++
+     R_EndFrame();
+ 
+     recursive--;

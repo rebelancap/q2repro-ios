@@ -1,0 +1,289 @@
+R20 — the per-eye lighting split: the headset's frustum, injectable on a simulator,
+and the instruments that name the channel it acts through.
+
+EVERYTHING IN THIS PATCH IS OFF BY DEFAULT and inert in a shipped frame:
+
+  gl_vrtan0 / gl_vrtan1   empty      inject a per-eye frustum (the Vision Pro's own
+                                     tangents, which a visionOS SIMULATOR never reports)
+  gl_vrtancull            0          apply the injection to the CULLING frustum only, so
+                                     the two eye images stay pixel-comparable
+  gl_batchshots           0          print the next N renders' per-batch light sets
+  gl_dlight_batchkey      0          CANDIDATE (not a fix): put the face's light set in the
+                                     batch key so shading is per-face and view-independent
+
+and three prints that only appear under gl_lightdiag / gl_batchshots:
+  DRAWDIAG ... batches= ubits= tan=   the batch side of 0043, plus the frustum used
+  PPLBATCH / PPLUBO / FACEBITS        the batch union, the UBO bytes, and every drawn
+                                      face's bits — the three places a per-eye lighting
+                                      difference can be born
+
+Measurements, controls and conclusions: artifacts/vr-r20/DIAG-per-eye-spot.md
+
+--- a/src/refresh/gl.h
++++ b/src/refresh/gl.h
+@@ -167,6 +167,14 @@
+     uint32_t        drawlight_hash;
+     uint32_t        drawlight_gated;    // faces whose bits failed the stamp gate
+     int             drawlight_faces;
++    // [vr overlay 0044 — R20 DIAGNOSTIC ONLY] The BATCH side of the same question. 0043
++    // measures the bits each FACE contributed; this measures what each face was actually
++    // SHADED with, which under per-pixel lighting is the batch's UNION (tess.c GL_Flush3D
++    // assigns glr.ppl_dlight_bits = tess.dlight_bits and shader_load_lights builds the UBO
++    // from it). A face's own bits can be identical in both eyes while the union it is drawn
++    // inside differs, because the union is over the faces the eye's frustum let through.
++    uint64_t        drawlight_union;    // OR of every batch union this render
++    int             drawlight_batches;  // batches flushed with a non-zero union
+     int             viewcluster1;
+     int             viewcluster2;
+     int             nodes_visible;
+@@ -286,6 +294,8 @@
+ extern cvar_t *gl_dynamic;
+ // [vr overlay 0040] cvar-gated lighting-divergence instrument (see GL_LightDiag, world.c)
+ extern cvar_t *gl_lightdiag;
++extern cvar_t *gl_batchshots;   // [vr overlay 0044 — R20 diagnostic] PPLBATCH one-shot
++extern cvar_t *gl_dlight_batchkey;  // [vr overlay 0045]
+ extern cvar_t *gl_dlight_falloff;
+ extern cvar_t *gl_modulate_entities;
+ extern cvar_t *gl_glowmap_intensity;
+--- a/src/refresh/main.c
++++ b/src/refresh/main.c
+@@ -48,6 +48,38 @@
+ cvar_t *gl_brightness;
+ cvar_t *gl_dynamic;
+ cvar_t *gl_lightdiag;    // [vr overlay 0040]
++// [vr overlay 0044 — R20 DIAGNOSTIC ONLY] THE HEADSET'S FRUSTUM, ON A SIMULATOR.
++// A visionOS SIMULATOR reports one symmetric view (VRFRUSTUM dtan=0.00000 by construction),
++// so every per-eye question that turns on the SHAPE of the two frusta is unmeasurable here.
++// The device's are strongly asymmetric and mirrored — measured on the test headset:
++//   e0 (L,R,U,D) = (1.732, 1.000, 1.000, 1.192)   e1 = (1.000, 1.732, 1.000, 1.192)
++// i.e. each eye sees ~60 deg outward and ~45 deg inward. These two cvars latch those
++// tangents over whatever the shell filled in, per eye, for the duration of the render:
++//   gl_vrtan0 "1.732 1.0 1.0 1.192"   gl_vrtan1 "1.0 1.732 1.0 1.192"   (device shape)
++//   gl_vrtan0 "1.732 1.0 1.0 1.192"   gl_vrtan1 "1.732 1.0 1.0 1.192"   (both eyes = eye 0)
++// The second form is the control: it keeps the injection, the stereo baseline and every
++// other difference between the two renders, and removes ONLY the frustum asymmetry.
++// Empty (the default) is off and the shipped path is untouched.
++cvar_t *gl_vrtan0;
++cvar_t *gl_vrtan1;
++// [vr overlay 0044 — R20 DIAGNOSTIC ONLY] `gl_vrtancull 1` applies the injected tangents to
++// the CULLING FRUSTUM ONLY and leaves the PROJECTION as the shell filled it. That turns the
++// injection into a clean instrument instead of a second variable: with `q2vrmono 1` the two
++// eyes then render the same camera through the same projection, so the two images are
++// pixel-comparable, and — because the injected frustum strictly CONTAINS the simulator's
++// symmetric one on every edge (1.732/1.000/1.000/1.192 vs 1.000/1.000/0.562/0.562) — no
++// visible geometry is culled away by either eye. The ONLY thing that differs between the two
++// renders is which OFFSCREEN faces each eye's node walk let through, i.e. exactly the
++// per-batch dlight union. Any pixel that differs is that channel and nothing else.
++cvar_t *gl_vrtancull;
++// [vr overlay 0044 — R20 DIAGNOSTIC ONLY] PPLBATCH is one line per lit batch per render
++// (~55 lines x 2 renders x the frame rate), which is enough console traffic to disturb the
++// thing being measured. `gl_batchshots 2` prints exactly the next two renders — one eye pair
++// — and counts itself back down to 0. tess.c reads it; R_RenderFrame decrements it.
++cvar_t *gl_batchshots;
++// [vr overlay 0045] see tess.c GL_DrawFace: 1 makes a face's per-pixel light set its own
++// bits rather than its batch's union, which is what makes the shading view-independent.
++cvar_t *gl_dlight_batchkey;
+ cvar_t *gl_dlight_falloff;
+ cvar_t *gl_modulate_entities;
+ cvar_t *gl_glowmap_intensity;
+@@ -111,6 +143,19 @@
+ // Derivation: the right edge direction is F - L*tan_r (F forward, L left, U up), so the
+ // right plane's inward normal is F*tan_r + L, normalised. The other three follow by sign.
+ // With tan_l == tan_r == tan(fov_x/2) this reproduces the symmetric planes exactly.
++// [vr overlay 0044 — R20 DIAGNOSTIC ONLY] see the gl_vrtan0/1/cull block at the top.
++static void GL_InjectTangents(void)
++{
++    const char *s = (q2vr.eye & 1) ? gl_vrtan1->string : gl_vrtan0->string;
++    float t[4];
++
++    if (*s && sscanf(s, "%f %f %f %f", &t[0], &t[1], &t[2], &t[3]) == 4 &&
++        t[0] > 0 && t[1] > 0 && t[2] > 0 && t[3] > 0) {
++        q2vr.tan_l = t[0]; q2vr.tan_r = t[1];
++        q2vr.tan_u = t[2]; q2vr.tan_d = t[3];
++    }
++}
++
+ static void GL_SetupFrustumTangents(void)
+ {
+     vec3_t forward;
+@@ -896,6 +941,14 @@
+     Q_assert(gl_static.world.cache || (fd->rdflags & RDF_NOWORLDMODEL));
+ 
+     glr.drawframe++;
++
++    // [vr overlay 0044 — R20 DIAGNOSTIC ONLY] Latch the injected per-eye tangents, if any,
++    // before the two consumers run: GL_SetupFrustum (the culling planes, below) and
++    // GL_Setup3D → Matrix_FrustumTangents (the projection, state.c). Both are called later
++    // in THIS function, and the shell rewrites q2vr.tan_* before every render, so nothing
++    // persists past this frame.
++    if (q2vr.active && !gl_vrtancull->integer)
++        GL_InjectTangents();
+ 
+     // [vr overlay 0031] LIGHTING IDEMPOTENCE FOR THE SECOND EYE. R_RenderFrame consumes
+     // dynamic-light state: GL_MarkLights bumps glr.dlightframe and stamps every lit face with
+@@ -949,6 +1002,8 @@
+     glr.drawlight_hash = 0;
+     glr.drawlight_faces = 0;
+     glr.drawlight_gated = 0;
++    glr.drawlight_union = 0;        // [vr overlay 0044]
++    glr.drawlight_batches = 0;      // [vr overlay 0044]
+ 
+     if (gl_dynamic->integer != 1 || gl_vertexlight->integer)
+         glr.fd.num_dlights = 0;
+@@ -978,6 +1033,11 @@
+ 
+     GL_Setup3D();
+ 
++    // [vr overlay 0044] cull-only injection: the projection above kept the shell's tangents,
++    // the culling planes below get the injected ones.
++    if (q2vr.active && gl_vrtancull->integer)
++        GL_InjectTangents();
++
+     GL_SetupFrustum();
+ 
+     if (!(glr.fd.rdflags & RDF_NOWORLDMODEL) && gl_drawworld->integer)
+@@ -1046,9 +1106,19 @@
+     // agree on all three — a difference is a per-eye lighting divergence at the point where
+     // pixels are decided.
+     if (gl_lightdiag->integer)
+-        Com_Printf("DRAWDIAG eye=%d rep=%d faces=%d gated=%u dbh=%08x\n",
++        // [vr overlay 0044] ...plus the BATCH side: ubits is the OR of every batch union
++        // this render and batches is how many lit batches there were. tan is the frustum the
++        // render actually used, so an injected run says so in its own log.
++        Com_Printf("DRAWDIAG eye=%d rep=%d faces=%d gated=%u dbh=%08x "
++                   "batches=%d ubits=%016llx tan=%.3f,%.3f,%.3f,%.3f\n",
+                    q2vr.active ? q2vr.eye : -1, glr.repeat_frame ? 1 : 0,
+-                   glr.drawlight_faces, glr.drawlight_gated, glr.drawlight_hash);
++                   glr.drawlight_faces, glr.drawlight_gated, glr.drawlight_hash,
++                   glr.drawlight_batches, (unsigned long long)glr.drawlight_union,
++                   q2vr.tan_l, q2vr.tan_r, q2vr.tan_u, q2vr.tan_d);
++
++    // [vr overlay 0044] the PPLBATCH one-shot spends one render per call
++    if (gl_batchshots->integer > 0)
++        Cvar_SetInteger(gl_batchshots, gl_batchshots->integer - 1, FROM_CODE);
+ }
+ 
+ bool R_SupportsPerPixelLighting(void)
+@@ -1267,6 +1337,16 @@
+     gl_dynamic = Cvar_Get("gl_dynamic", "1", 0);
+     // [vr overlay 0040] 1 = print LIGHTALIAS/LIGHTDIAG once per world render (diagnostic only)
+     gl_lightdiag = Cvar_Get("gl_lightdiag", "0", 0);
++    // [vr overlay 0044 — R20 diagnostic] see the block near gl_lightdiag above
++    gl_vrtan0 = Cvar_Get("gl_vrtan0", "", 0);
++    gl_vrtan1 = Cvar_Get("gl_vrtan1", "", 0);
++    gl_vrtancull = Cvar_Get("gl_vrtancull", "0", 0);
++    gl_batchshots = Cvar_Get("gl_batchshots", "0", 0);
++    // DEFAULT 0: a CANDIDATE, not a fix. It makes the shading view-independent by
++    // construction and costs 3-4x batches, but at every pose where the per-eye split was
++    // visible on the simulator, turning it on changed the picture by at most 1/255 and did
++    // not close the split (artifacts/vr-r20/DIAG-per-eye-spot.md). Off until it earns its way in.
++    gl_dlight_batchkey = Cvar_Get("gl_dlight_batchkey", "0", 0);
+     gl_dynamic->changed = gl_lightmap_changed;
+     gl_dlight_falloff = Cvar_Get("gl_dlight_falloff", "1", 0);
+     gl_modulate_entities = Cvar_Get("gl_modulate_entities", "1", 0);
+--- a/src/refresh/tess.c
++++ b/src/refresh/tess.c
+@@ -797,6 +797,21 @@
+         // MESH's light list - which GL_LoadLights then keys the UBO upload on. Assigning it
+         // here every flush makes the value belong to the batch being drawn and nothing else.
+         glr.ppl_dlight_bits = tess.dlight_bits;
++        // [vr overlay 0044 — R20 DIAGNOSTIC ONLY] THE BATCH UNION, AT THE MOMENT IT BECOMES
++        // THE SHADER'S LIGHT LIST. Everything the fragment shader knows about dynamic light
++        // for every face in this batch is decided by this one value, so this is the last
++        // place a per-eye difference can be observed before it is pixels. gl_lightdiag 2
++        // prints one line per lit batch (verbose — use the one-shot in main.c); any setting
++        // accumulates the per-render union and batch count that DRAWDIAG reports.
++        if (tess.dlight_bits) {
++            glr.drawlight_union |= tess.dlight_bits;
++            glr.drawlight_batches++;
++            if (gl_batchshots->integer > 0)
++                Com_Printf("PPLBATCH eye=%d rep=%d tex=%u nv=%d bits=%016llx\n",
++                           q2vr.active ? q2vr.eye : -1, glr.repeat_frame ? 1 : 0,
++                           (unsigned)tess.texnum[TMU_TEXTURE], tess.numverts,
++                           (unsigned long long)tess.dlight_bits);
++        }
+         if (tess.dlight_bits && glr.ppl_bits)
+             state |= glr.ppl_bits;
+         array |= GLA_NORMAL;
+@@ -904,8 +919,29 @@
+         }
+     }
+ 
++    // [vr overlay 0045] THE FACE'S LIGHT SET IS PART OF THE BATCH KEY.
++    //
++    // Under per-pixel lighting a batch uploads ONE dlight block, built from the UNION of
++    // every face in it (GL_Flush3D below assigns glr.ppl_dlight_bits = tess.dlight_bits and
++    // shader.c shader_load_lights fills the UBO from that). So a face is not shaded with the
++    // lights that MARKED it — it is shaded with the lights that marked anything sharing its
++    // texture and state in this batch. Which faces those are is decided by the frustum, and
++    // in VR the two eyes have different frusta: measured on the Vision Pro's own tangents
++    // (artifacts/vr-r20/), the same visible wall was shaded with lights 21/22/23 in eye 0 and
++    // without them in eye 1, from one head yaw, at one position, with an identical light
++    // list. That is a surface lit in one eye and dark in the other, and it is also the
++    // "walls step lighter and darker as you walk" artefact on a flat screen — upstream has
++    // it too, it just has no second eye to disagree with.
++    //
++    // Splitting the batch whenever the light set changes makes a face's shading a function
++    // of its OWN bits and nothing else, which is view-independent by construction. It costs
++    // batches (measured on base1 in artifacts/vr-r20/DIAG-per-eye-spot.md), so it is a live
++    // cvar rather than an unconditional change until that cost is judged.
++    const uint64_t face_bits = (surf->dlightframe == glr.dlightframe) ? surf->dlightbits : 0;
++
+     if (memcmp(tess.texnum, texnum, sizeof(texnum)) ||
+         tess.flags != state ||
++        (gl_dlight_batchkey->integer && tess.numindices && face_bits != tess.dlight_bits) ||
+         tess.numindices + numindices > TESS_MAX_INDICES) {
+         GL_Flush3D();
+     }
+@@ -944,13 +980,24 @@
+     // as the head moves. surf->dlightframe is already maintained beside the bits by
+     // GL_MarkLights_r; honouring it costs one compare per face and tends to REDUCE the number
+     // of lights per batch. Upstream bug, upstreamable as-is.
+-    if (surf->dlightframe == glr.dlightframe)
+-        tess.dlight_bits |= surf->dlightbits;
++    tess.dlight_bits |= face_bits;   // [vr overlay 0045] gate hoisted to the batch key above
+ 
++    // [vr overlay 0044 — R20 DIAGNOSTIC ONLY] EVERY DRAWN FACE, WITH THE BITS IT CARRIED
++    // AND THE BATCH IT LANDED IN. 0043's dbh is a hash over the same thing, which can say
++    // THAT two renders disagree but never WHICH faces. This prints the raw pairs so the two
++    // eyes' face -> bits maps can be intersected: a face drawn by both eyes with different
++    // bits is a marking divergence, a face drawn by both with the same bits but a different
++    // batch id is the union channel, and a face only one eye drew is view culling.
++    if (gl_batchshots->integer > 0)
++        Com_Printf("FACEBITS eye=%d rep=%d f=%d bits=%016llx tex=%u\n",
++                   q2vr.active ? q2vr.eye : -1, glr.repeat_frame ? 1 : 0,
++                   (int)(surf - gl_static.world.cache->faces),
++                   (unsigned long long)face_bits, (unsigned)texnum[TMU_TEXTURE]);
++
+     // [vr overlay 0043] the draw-time per-eye instrument (see gl.h). Costs one branch per
+     // face when gl_lightdiag is 0, which is every shipped frame.
+     if (gl_lightdiag->integer) {
+-        uint64_t bits = (surf->dlightframe == glr.dlightframe) ? surf->dlightbits : 0;
++        uint64_t bits = face_bits;
+         uint32_t h = 2166136261u ^ (uint32_t)(surf - gl_static.world.cache->faces);
+         h = (h * 16777619u) ^ (uint32_t)(bits & 0xffffffffu);
+         h = (h * 16777619u) ^ (uint32_t)(bits >> 32);
+--- a/src/refresh/shader.c
++++ b/src/refresh/shader.c
+@@ -1069,6 +1069,21 @@
+     gls.u_dlights.num_dlights = i;
+     c.dlightsUsed += i;
+ 
++    // [vr overlay 0044 — R20 DIAGNOSTIC ONLY] THE BYTES THAT ACTUALLY REACH THE SHADER.
++    // Everything upstream of here (the face's bits, the batch union, the stamp gate) can be
++    // proven equal between the eyes and the picture still differ, so this prints the UBO
++    // itself: the key it was uploaded under, how many lights survived compaction, and a hash
++    // of the light data. Two renders of one host frame must upload the same set of these.
++    if (gl_batchshots->integer > 0) {
++        uint32_t h = 2166136261u;
++        const unsigned char *raw = (const unsigned char *)gls.u_dlights.lights;
++        for (size_t k = 0; k < sizeof(gls.u_dlights.lights[0]) * (size_t)i; k++)
++            h = (h * 16777619u) ^ raw[k];
++        Com_Printf("PPLUBO eye=%d rep=%d bits=%016llx n=%d h=%08x\n",
++                   q2vr.active ? q2vr.eye : -1, glr.repeat_frame ? 1 : 0,
++                   (unsigned long long)glr.ppl_dlight_bits, i, h);
++    }
++
+     GL_BindBuffer(GL_UNIFORM_BUFFER, gl_static.dlight_buffer);
+     qglBufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(GLint[4]) + (sizeof(gls.u_dlights.lights[0]) * gls.u_dlights.num_dlights), &gls.u_dlights);
+     c.uniformUploads++;

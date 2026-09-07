@@ -1,0 +1,103 @@
+Subject: [overlay 0043] DRAWDIAG — the per-eye light question asked where pixels are decided
+
+R19 item 2 is the other half of the base1 report: at one spot a wall is "LIGHT in my left
+eye, DARK in my right eye". 0042's header shows the CLIENT cannot cause that — the light
+selection reads cl.refdef.vieworg before view.c injects the per-eye pose, so both eyes select
+the identical set (measured: LIGHTDIAG lh identical on 1841/1841 walk pairs). So the split, if
+it exists, is in the refresh.
+
+0040's LIGHTDIAG already prints `marked=` and `bh=` (a hash of every world face's dlightbits),
+but it samples them immediately after GL_MarkLights — BEFORE the entity and alpha passes, both
+of which write face stamps (world.c re-stamps an inline bmodel's alpha faces with the world's
+stamp, 0039). That is why eye 1 legitimately reports 5-10 more marked faces than eye 0 for the
+same host frame: eye 0's own bmodel pass stamped them after eye 0's sample was taken. The
+instrument therefore cannot distinguish "the two eyes light faces differently" from "the two
+eyes were measured at different points in the pipeline".
+
+DRAWDIAG closes that. In GL_DrawFace — the single place a face's dlightbits reach a batch, and
+the place 0039's stamp gate decides whether they count — this accumulates an ORDER-INDEPENDENT
+hash over (face index, the bits that face actually contributed), plus the face count and the
+number of faces whose bits the gate rejected. It is printed at the very END of R_RenderFrame,
+after every pass. Two renders of the same host frame that drew the same faces with the same
+lights produce identical faces/gated/dbh; any difference between eye 0 and eye 1 IS the per-eye
+lighting divergence, at the last point before the shader.
+
+Diagnostic only: everything is under the existing gl_lightdiag cvar (default 0), and the cost
+when it is off is one already-loaded branch per batched face. No rendering behaviour changes.
+
+Apply: patch -p1 -d vendor/q2repro < this
+--- a/src/refresh/gl.h
++++ b/src/refresh/gl.h
+@@ -156,6 +156,17 @@
+     // use (artifacts/vr-r14c/after/).
+     unsigned        dlightframe_high;
+     bool            repeat_frame;
++    // [vr overlay 0043] DRAW-TIME per-eye light instrument (diagnostic only). GL_DrawFace
++    // accumulates, for every face it batches, an order-independent hash of (face index, the
++    // dlightbits that face actually contributed after 0039's stamp gate). Two renders of the
++    // same host frame that drew the same faces with the same lights produce the same hash;
++    // a difference between eye 0 and eye 1 is a PER-EYE LIGHTING DIVERGENCE at the only place
++    // that decides pixels. LIGHTDIAG's marked/bh are sampled right after GL_MarkLights, which
++    // is before the entity and alpha passes have touched any stamps, so they cannot answer
++    // this question on their own.
++    uint32_t        drawlight_hash;
++    uint32_t        drawlight_gated;    // faces whose bits failed the stamp gate
++    int             drawlight_faces;
+     int             viewcluster1;
+     int             viewcluster2;
+     int             nodes_visible;
+--- a/src/refresh/tess.c
++++ b/src/refresh/tess.c
+@@ -946,6 +946,19 @@
+     // of lights per batch. Upstream bug, upstreamable as-is.
+     if (surf->dlightframe == glr.dlightframe)
+         tess.dlight_bits |= surf->dlightbits;
++
++    // [vr overlay 0043] the draw-time per-eye instrument (see gl.h). Costs one branch per
++    // face when gl_lightdiag is 0, which is every shipped frame.
++    if (gl_lightdiag->integer) {
++        uint64_t bits = (surf->dlightframe == glr.dlightframe) ? surf->dlightbits : 0;
++        uint32_t h = 2166136261u ^ (uint32_t)(surf - gl_static.world.cache->faces);
++        h = (h * 16777619u) ^ (uint32_t)(bits & 0xffffffffu);
++        h = (h * 16777619u) ^ (uint32_t)(bits >> 32);
++        glr.drawlight_hash += h;    // commutative: batch ORDER must not change the hash
++        glr.drawlight_faces++;
++        if (surf->dlightframe != glr.dlightframe && surf->dlightbits)
++            glr.drawlight_gated++;
++    }
+ }
+ 
+ void GL_ClearSolidFaces(void)
+--- a/src/refresh/main.c
++++ b/src/refresh/main.c
+@@ -944,6 +944,11 @@
+ 
+     glr.fd = *fd;
+     glr.ppl_bits  = 0;
++
++    // [vr overlay 0043] reset the draw-time light instrument for this render (see gl.h)
++    glr.drawlight_hash = 0;
++    glr.drawlight_faces = 0;
++    glr.drawlight_gated = 0;
+ 
+     if (gl_dynamic->integer != 1 || gl_vertexlight->integer)
+         glr.fd.num_dlights = 0;
+@@ -1032,6 +1037,18 @@
+ 
+     if (gl_showerrors->integer > 1)
+         GL_ShowErrors(__func__);
++
++    // [vr overlay 0043] THE DRAW-TIME PER-EYE ANSWER. Printed after every pass that can touch
++    // a face's stamp or bits has run, unlike LIGHTDIAG which is sampled right after
++    // GL_MarkLights. dbh is an order-independent hash over (face, the bits that face actually
++    // contributed to its batch); faces is how many faces were batched; gated counts faces
++    // that carried bits the stamp gate rejected. eye 0 and eye 1 of the same host frame must
++    // agree on all three — a difference is a per-eye lighting divergence at the point where
++    // pixels are decided.
++    if (gl_lightdiag->integer)
++        Com_Printf("DRAWDIAG eye=%d rep=%d faces=%d gated=%u dbh=%08x\n",
++                   q2vr.active ? q2vr.eye : -1, glr.repeat_frame ? 1 : 0,
++                   glr.drawlight_faces, glr.drawlight_gated, glr.drawlight_hash);
+ }
+ 
+ bool R_SupportsPerPixelLighting(void)

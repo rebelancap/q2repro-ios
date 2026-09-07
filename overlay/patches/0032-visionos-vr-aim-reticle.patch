@@ -1,0 +1,311 @@
+[vr overlay R8] The VR aim reticle: aim it where the camera is looking, and draw
+it as its own bright mark instead of as a particle.
+
+Reported in the headset on 1.0.11.10: "the VR crosshair does not show anywhere".
+It was added every frame — proven from the headset itself, because the flat 2D
+crosshair is suppressed only when dot_drawn is 1 and that one was missing too.
+Four faults, and the simulator found the two that actually hid it:
+
+  1. THE RAY WAS IN THE WRONG FRAME, which is what put the mark outside the
+     view. `hand_ray_ang` carries the play-space body yaw; the RENDER adds the
+     server's own re-orientation on top of it (view.c: viewangles[YAW] +
+     server_yaw when yaw_relative), and every Quake II spawn sets
+     delta_angles[YAW] to the spawn angle. On base1 the two differ by 135
+     degrees. Measured with the draw instrumented: the reticle's world point
+     came back 119 units along +x while the camera faced (-0.71, +0.71).
+  2. IT WAS A PARTICLE, and a particle cannot be a reticle. Driven to
+     `gl_partscale 200` the sprite covers a third of the eye image, so it was
+     never depth-failing and never culled — but its peak contribution over the
+     background is about a third of its own colour, and at eight times size it
+     smears into a sliver rather than growing into a mark. TEXNUM_PARTICLE is a
+     soft radially-faded blob meant to be one of hundreds in a spray. The
+     reticle now carries its own world points in q2vr and the refresh draws them
+     itself (GL_DrawVRReticle, tess.c): white texture, full alpha, depth test
+     off — which is what every shipped VR crosshair does, because one hidden
+     behind the player's own gun barrel is not doing its job.
+  3. The call ran from CL_AddEntities, which V_RenderView reaches BEFORE view.c
+     composes the VR head pose into cl.refdef.vieworg — so even a correctly
+     aimed trace started at the pre-VR origin and was displaced by the whole
+     room-scale offset. It moves to the end of the VR block in view.c.
+  4. The standoff was max(1, range*0.004) — one unit below 250 units of range.
+     It is now clamp(range*0.03, 6, 64); with the depth test off it is no longer
+     what keeps the mark out of the wall, it is what keeps it at the right
+     STEREO depth.
+
+The mark is five points — a centre at a 0.92-degree angular size plus four
+satellites at half that, 2.2 degrees out along the RAY's own right/up — so it
+stays square to where the hand points and a busy wall texture cannot swallow it.
+
+Verified on the Vision Pro simulator, in the eye image and not the UI texture
+(the readback three rounds of reticle work were asserted against, where a world
+particle can never appear): 3200 bright pixels in a compact 114x114 box centred
+at (2399, 1351) of a 4800x2704 eye, peak luma +234 over the same frame with
+`q2vrdot 0`. Suite case R8-5.
+
+--- a/inc/shared/shared.h
++++ b/inc/shared/shared.h
+@@ -1411,6 +1411,25 @@
+     float   vm_pivot[3];        // WRITTEN BY THE ENGINE: the point Weapon Size scales ABOUT,
+                                 // recovered from the origin the entity was actually given
+                                 // rather than predicted from the inputs. See view.c.
++
++    // [vr overlay R8] APPENDED, never inserted, for the sixth time — THE AIM RETICLE'S OWN
++    // GEOMETRY, because the particle pipeline could not carry it.
++    //
++    // The reticle was a particle for three rounds and was invisible in the headset for all
++    // three. Measured on the simulator: driven to `gl_partscale 200` the quad covers a third
++    // of the eye and is unmistakably present — so it was never depth-failing, never
++    // mispointed, never culled — yet at any sane size its peak contribution over the
++    // background is about 30% of its own colour and it reads as a faint smudge, and at 8x it
++    // reads as a smeared sliver. A particle is a soft, radially-faded sprite meant to be one
++    // of hundreds in a spray; a reticle is a hard mark that must be legible alone. So the
++    // reticle now carries its OWN points here and the refresh draws them itself, with the
++    // white texture, full alpha and the depth test off (GL_DrawVRReticle in tess.c). Depth
++    // off is deliberate and is what every shipped VR crosshair does: a reticle hidden behind
++    // your own gun barrel is a reticle that is not doing its job. Stereo depth still comes
++    // from where the points ARE, which is the trace hit, so it still fuses at the surface.
++    float   dot_pts[5][3];      // WRITTEN BY THE ENGINE: world points, centre first
++    float   dot_half[5];        // WRITTEN BY THE ENGINE: half-extent of each, world units
++    int     dot_npts;           // WRITTEN BY THE ENGINE: how many of them are live
+ } q2_vr_state_t;
+ 
+ extern q2_vr_state_t q2vr;
+--- a/src/client/entities.c
++++ b/src/client/entities.c
+@@ -1482,10 +1482,13 @@
+     // add the weapon
+     CL_AddViewWeapon();
+ 
+-    // [vr overlay R4] and the aim dot, AFTER it: CL_AddViewWeapon early-returns on cl_gun 0
+-    // and on a missing model, and a player who has hidden the gun still has to be able to see
+-    // where they are pointing.
+-    CL_VR_AddAimDot();
++    // [vr overlay R8] THE AIM DOT IS NOT ADDED HERE ANY MORE, and the reason is the whole of
++    // R8's crosshair bug. CL_AddEntities runs from V_RenderView BEFORE view.c composes the VR
++    // head pose into cl.refdef.vieworg (bodyofs, eyeofs, the standing-height rise), so a trace
++    // started here leaves from the PRE-VR origin and the dot lands displaced by the entire
++    // room-scale offset — pointing at a wall and seeing the dot metres away, or nowhere.
++    // The call now lives at the end of the VR block in view.c, where the view origin is final
++    // and cl.refdef.num_particles has not been latched yet.
+ 
+     cl.thirdPersonView = false;
+ }
+@@ -1563,18 +1566,36 @@
+ #define VR_DOT_RANGE 8192.0f
+ void CL_VR_AddAimDot(void)
+ {
+-    particle_t p;
+     trace_t tr;
+-    vec3_t start, end, f, r, u, mins, maxs;
++    vec3_t start, end, f, r, u, mins, maxs, base;
++    float standoff, spread, half, scale;
++    int i;
+ 
+     q2vr.dot_drawn = 0;
+     q2vr.dot_range = 0.0f;
++    q2vr.dot_npts = 0;
+     if (!q2vr.active || !q2vr.aim_dot || !q2vr.hand_valid)
+         return;
+     if (!cl.bsp || !cl.bsp->nodes)
+         return;
+ 
+-    AngleVectors(q2vr.hand_ray_ang, f, r, u);
++    // [vr overlay R8] THE RAY IS THE CAMERA'S FRAME, NOT THE HAND'S RAW ONE, and this is the
++    // fault that actually hid the reticle. `hand_ray_ang` carries the play-space body yaw;
++    // the RENDER adds the server's own re-orientation on top of it (view.c: vrang[YAW] =
++    // viewangles[YAW] + server_yaw when yaw_relative). Every Quake II spawn sets
++    // delta_angles[YAW] to the spawn angle, so on base1 the two differ by 135 degrees — the
++    // trace went off at a right angle to where the player was looking and the mark landed
++    // outside the frustum entirely. Measured, not deduced: with the draw instrumented the
++    // reticle's world point came back 119 units along +x while the camera was facing
++    // (-0.71, +0.71). The same term, from the same field, as the render uses.
++    {
++        vec3_t ray;
++        ray[PITCH] = q2vr.hand_ray_ang[PITCH];
++        ray[YAW]   = q2vr.hand_ray_ang[YAW] +
++                     (q2vr.yaw_relative ? q2vr.server_yaw : 0.0f);
++        ray[ROLL]  = 0.0f;
++        AngleVectors(ray, f, r, u);
++    }
+     VectorCopy(cl.refdef.vieworg, start);
+     VectorMA(start, VR_DOT_RANGE, f, end);
+     VectorSet(mins, 0, 0, 0);
+@@ -1584,20 +1605,35 @@
+         return;
+ 
+     q2vr.dot_range = VR_DOT_RANGE * tr.fraction;
+-    // Lift off the surface proportionally rather than by a fixed amount: collision geometry is
+-    // chorded more coarsely than the drawn mesh, so a constant pull-back that hides the seam
+-    // at ten metres floats visibly at one.
+-    VectorMA(tr.endpos, -max(1.0f, q2vr.dot_range * 0.004f), f, p.origin);
+-    p.color = -1;
+-    p.rgba.u8[0] = 255;
+-    p.rgba.u8[1] = tr.fraction >= 1.0f ? 150 : 235;   // a sky miss reads dimmer, on purpose
+-    p.rgba.u8[2] = tr.fraction >= 1.0f ? 150 : 190;
+-    p.rgba.u8[3] = 255;
+-    p.alpha = 1.0f;
+-    // The particle pipeline already scales with distance, so this is an angular size and not
+-    // a world size; 1.0 is the shipped default and `q2vrdot <on> <scale>` tunes it live.
+-    p.scale = q2vr.aim_dot_scale > 0.01f ? q2vr.aim_dot_scale : 1.0f;
+-    V_AddParticle(&p);
++    // [vr overlay R8] THE STANDOFF. The refresh draws the reticle with the depth test off, so
++    // this is no longer what keeps it out of the wall — it is what keeps it at the right
++    // STEREO depth: the two eyes converge on where these points are, and a point exactly on
++    // the surface fights the surface's own texels for the same disparity. Clamped at both
++    // ends: a floor so the near field clears, a ceiling so a 4000-unit sky shot does not park
++    // the mark 120 units in front of the thing it is marking.
++    standoff = Q_clipf(q2vr.dot_range * 0.03f, 6.0f, 64.0f);
++    VectorMA(tr.endpos, -standoff, f, base);
++
++    // ANGULAR sizes, converted to world units at the hit range, so the reticle subtends the
++    // same amount of the player's view at one metre and at fifty. 0.0080 rad half-angle is a
++    // 0.92-degree centre mark; the satellites are half that, 2.2 degrees out along the RAY's
++    // own right/up (not the view's), so the figure stays square to where the hand points
++    // rather than shearing as the head rolls.
++    scale = q2vr.aim_dot_scale > 0.01f ? q2vr.aim_dot_scale : 1.0f;
++    half = max(0.6f, q2vr.dot_range * 0.0080f * scale);
++    spread = max(2.0f, q2vr.dot_range * 0.0190f * scale);
++
++    VectorCopy(base, q2vr.dot_pts[0]);
++    q2vr.dot_half[0] = half;
++    for (i = 0; i < 4; i++) {
++        const float sx = (i == 0) ? 1.0f : (i == 1) ? -1.0f : 0.0f;
++        const float sy = (i == 2) ? 1.0f : (i == 3) ? -1.0f : 0.0f;
++        VectorCopy(base, q2vr.dot_pts[i + 1]);
++        VectorMA(q2vr.dot_pts[i + 1], spread * sx, r, q2vr.dot_pts[i + 1]);
++        VectorMA(q2vr.dot_pts[i + 1], spread * sy, u, q2vr.dot_pts[i + 1]);
++        q2vr.dot_half[i + 1] = half * 0.5f;
++    }
++    q2vr.dot_npts = 5;
+     q2vr.dot_drawn = 1;
+ }
+ 
+--- a/src/client/view.c
++++ b/src/client/view.c
+@@ -687,6 +687,12 @@
+             // pose that was published instead of against what the code is believed to do.
+             q2vr.render_yaw = vrang[YAW];
+             q2vr.yaw_from_pose = 1;
++            // [vr overlay R8] THE AIM DOT, HERE and not in CL_AddEntities. It traces from
++            // cl.refdef.vieworg, and only now is that origin the one the eye will actually
++            // render from — the body offset, this eye's offset and the standing-height rise
++            // are all in. Added before the r_numparticles latch below, so it rides the same
++            // frame; it still honours cl_add_particles, which is the correct subordination.
++            CL_VR_AddAimDot();
+         } else if (cl_stereo_offset) {
+             // [stereo overlay] shift the eye sideways for stereoscopic 3D (parallel cameras — same
+             // view angles, so no vertical parallax). cl.v_right is set by CL_AddEntities above.
+--- a/src/refresh/gl.h
++++ b/src/refresh/gl.h
+@@ -983,6 +983,7 @@
+ 
+ void GL_Flush2D(void);
+ void GL_DrawParticles(void);
++void GL_DrawVRReticle(void);   // [vr overlay R8]
+ void GL_DrawBeams(void);
+ void GL_DrawFlares(void);
+ 
+--- a/src/refresh/main.c
++++ b/src/refresh/main.c
+@@ -929,6 +929,11 @@
+ 
+     GL_DrawParticles();
+ 
++    // [vr overlay R8] and the VR aim reticle, which is NOT a particle any more (tess.c has
++    // the measurement that settled why). Here rather than earlier so it sits over the world
++    // and its effects; its own state turns the depth test off.
++    GL_DrawVRReticle();
++
+     GL_OccludeFlares();
+ 
+     GL_DrawFlares();
+--- a/src/refresh/tess.c
++++ b/src/refresh/tess.c
+@@ -131,6 +131,87 @@
+     } while (total);
+ }
+ 
++// [vr overlay R8] THE VR AIM RETICLE, and it has its own draw for a measured reason.
++//
++// It was a particle for three rounds and it was never seen once. The simulator settled
++// why: at `gl_partscale 200` the particle quad covers a third of the eye image, so it was
++// never depth-failing and never mispointed — but the sprite's peak contribution over the
++// background is only about a third of its own colour, and at eight times size it smears into
++// a sliver rather than growing into a mark. TEXNUM_PARTICLE is a soft radially-faded blob
++// designed to be one of hundreds in a spray; a reticle is one hard mark that has to be
++// legible alone. So this draws the reticle's own quads, with the WHITE texture, full alpha,
++// and the depth test off.
++//
++// Depth off is deliberate, not a shortcut: a crosshair hidden behind the player's own gun
++// barrel is a crosshair that is not doing its job, and every shipped VR reticle draws over
++// the scene. The stereo cue is unaffected — the points are still at the trace hit, so the
++// two eyes converge on the surface the player is aiming at, which is the whole reason this
++// is a world reticle and not a screen one.
++//
++// Drawn after GL_DrawParticles in R_RenderFrame, so it sits over the world and its effects
++// but under nothing that matters.
++void GL_DrawVRReticle(void)
++{
++    vec_t *dst;
++    color_t color;
++    int numverts, i;
++
++    if (!q2vr.active || !q2vr.dot_drawn || q2vr.dot_npts <= 0)
++        return;
++
++    GL_LoadMatrix(gl_identity, glr.viewmatrix);
++    GL_LoadUniforms();
++    GL_BindArrays(VA_EFFECT);
++    GL_BindTexture(TMU_TEXTURE, TEXNUM_WHITE);
++    GL_StateBits(GLS_BLEND_BLEND | GLS_DEPTHMASK_FALSE | GLS_DEPTHTEST_DISABLE);
++    GL_ArrayBits(GLA_VERTEX | GLA_TC | GLA_COLOR);
++
++    color.u8[0] = 255;
++    color.u8[1] = 240;
++    color.u8[2] = 205;
++    color.u8[3] = 255;
++
++    dst = tess.vertices;
++    numverts = 0;
++    for (i = 0; i < q2vr.dot_npts && i < 5; i++) {
++        vec3_t a, b, c, d, ro, uo;
++        int k;
++        const vec_t *o = q2vr.dot_pts[i];
++        float h = q2vr.dot_half[i];
++
++        if (h <= 0.0f)
++            continue;
++        if (numverts + 6 > TESS_MAX_VERTICES)
++            break;
++
++        VectorScale(glr.viewaxis[1], h, ro);
++        VectorScale(glr.viewaxis[2], h, uo);
++        VectorSubtract(o, ro, a); VectorSubtract(a, uo, a);   // -r -u
++        VectorAdd(o, ro, b);      VectorSubtract(b, uo, b);   // +r -u
++        VectorAdd(o, ro, c);      VectorAdd(c, uo, c);        // +r +u
++        VectorSubtract(o, ro, d); VectorAdd(d, uo, d);        // -r +u
++
++        {
++            const vec_t *quad[6] = { a, b, c, a, c, d };
++            for (k = 0; k < 6; k++) {
++                VectorCopy(quad[k], dst);
++                dst[3] = 0;
++                dst[4] = 0;
++                WN32(dst + 5, color.u32);
++                dst += 6;
++                numverts++;
++            }
++        }
++    }
++
++    if (!numverts)
++        return;
++
++    GL_LockArrays(numverts);
++    qglDrawArrays(GL_TRIANGLES, 0, numverts);
++    GL_UnlockArrays();
++}
++
+ static void GL_FlushBeamSegments(void)
+ {
+     if (!tess.numindices)

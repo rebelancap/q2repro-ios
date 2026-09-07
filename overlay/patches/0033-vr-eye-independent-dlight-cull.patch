@@ -1,0 +1,123 @@
+Subject: [overlay 0033] eye-independent dynamic-light culling
+
+Third headset verdict follow-up: walls flip light<->dark while walking slowly past
+them, and sometimes only in ONE eye. Mechanism, file:line verified:
+
+  * the rerelease's shadowlights are real dlight_t's, re-added every frame from static map
+    entities (src/client/effects.c, V_AddLightEx in src/client/view.c), and
+    gl_per_pixel_lighting defaults to 1 — so ALL of that light goes through the ppl UBO;
+  * shader_load_lights culls each dlight with GL_CullSphere, which does `radius *=
+    glr.entscale`;
+  * glr.entscale is written ONLY by GL_SetEntityAxis and is never reset for the world pass.
+    During the world draw it holds whatever the LAST ENTITY of the PREVIOUS render left in
+    it — eye 1 inherits eye 0's, eye 0 inherits the previous frame's eye 1 — and entity
+    classification is per-eye frustum culled, so the last entity DIFFERS BETWEEN THE EYES.
+
+A shrunk radius drops the light entirely, so a whole panel face is dark in one eye and lit in
+the other, flipping as the player creeps past the boundary. A dlight is a world-space sphere
+with a world-space radius; no entity's scale has anything to say about it.
+
+Three changes:
+
+  * GL_CullLightSphere (main.c, prototype in gl.h beside GL_CullSphere): GL_CullSphere with
+    the entscale multiply removed, and CULL_IN unconditionally when q2vr.active — the two
+    eyes have different frusta, so any per-eye survivor set is a per-eye lighting difference
+    by construction;
+  * shader_load_lights uses it;
+  * R_RenderFrame invalidates gls.dlight_bits at the top of every render. GL_LoadLights
+    reloads the dlight UBO only when that key differs from glr.ppl_dlight_bits — a key that
+    says which lights are LIT and nothing about which eye culled them — so eye 1's first lit
+    batch could otherwise keep the block eye 0 uploaded from eye 0's survivors. One UBO
+    upload per render buys the question away.
+
+Companion to 0030 (constant render count) and 0031 (idempotent repeat render); those fixed
+WHEN the world is re-rendered, this fixes what the second render is allowed to see.
+
+--- a/src/refresh/main.c
++++ b/src/refresh/main.c
+@@ -223,6 +223,44 @@
+     return cull;
+ }
+ 
++// [vr overlay 0033] THE DLIGHT CULL, WHICH IS NOT THE ENTITY CULL.
++//
++// GL_CullSphere above multiplies the radius by glr.entscale, and entscale is written ONLY by
++// GL_SetEntityAxis — never reset for the world pass. During the world draw it therefore holds
++// whatever the LAST ENTITY of the PREVIOUS render left in it: in stereo, eye 1 inherits eye
++// 0's and eye 0 inherits the previous frame's eye 1, and because entity classification is
++// per-eye frustum culled, the last entity differs BETWEEN THE EYES. A shrunk radius makes
++// shader_load_lights drop the light entirely, so a whole panel face goes dark in one eye and
++// stays lit in the other, flipping as the player creeps past the boundary — the reported "walls
++// flip light and dark while walking slowly, sometimes one eye only".
++//
++// A dlight is a world-space sphere with a world-space radius; no entity's scale has anything
++// to say about it. This is GL_CullSphere with that multiply removed. In VR it culls nothing at
++// all: the two eyes have different frusta, so any per-eye survivor set is a per-eye lighting
++// difference by construction, and the shadowlight set is small enough that keeping all of it
++// is cheaper than a class of artefact that reads as a tracking bug.
++glCullResult_t GL_CullLightSphere(const vec3_t origin, float radius)
++{
++    const cplane_t *p;
++    glCullResult_t cull;
++    float dist;
++    int i;
++
++    if (!gl_cull_models->integer || q2vr.active)
++        return CULL_IN;
++
++    cull = CULL_IN;
++    for (i = 0, p = glr.frustumPlanes; i < 4; i++, p++) {
++        dist = PlaneDiff(origin, p);
++        if (dist < -radius)
++            return CULL_OUT;
++        if (dist <= radius)
++            cull = CULL_CLIP;
++    }
++
++    return cull;
++}
++
+ glCullResult_t GL_CullLocalBox(const vec3_t origin, const vec3_t bounds[2])
+ {
+     vec3_t points[8];
+@@ -879,6 +917,15 @@
+     else
+         glr.dlightframe_base = glr.dlightframe;
+ 
++    // [vr overlay 0033] FORCE THE PER-PIXEL-LIGHTING UBO TO RELOAD FOR THIS RENDER.
++    // GL_LoadLights reloads the dlight uniform block only when gls.dlight_bits differs from
++    // glr.ppl_dlight_bits — a key that says WHICH LIGHTS ARE LIT, and nothing about which eye
++    // culled them. Two renders of the same frame have the same bits, so eye 1's first lit
++    // batch could keep the block eye 0 uploaded (built from eye 0's frustum survivors), which
++    // is the same one-eye-dark artefact from the other end. Invalidating the key at the top of
++    // every render costs one UBO upload per render and removes the question.
++    gls.dlight_bits = ~(uint64_t)0;
++
+     glr.fd = *fd;
+     glr.ppl_bits  = 0;
+ 
+--- a/src/refresh/gl.h
++++ b/src/refresh/gl.h
+@@ -310,6 +310,9 @@
+ 
+ glCullResult_t GL_CullBox(const vec3_t bounds[2]);
+ glCullResult_t GL_CullSphere(const vec3_t origin, float radius);
++// [vr overlay 0033] The same test WITHOUT glr.entscale — for world-space dynamic lights,
++// which no entity's scale applies to. CULL_IN unconditionally in VR (see main.c).
++glCullResult_t GL_CullLightSphere(const vec3_t origin, float radius);
+ glCullResult_t GL_CullLocalBox(const vec3_t origin, const vec3_t bounds[2]);
+ 
+ bool GL_AllocBlock(int width, int height, uint16_t *inuse,
+--- a/src/refresh/shader.c
++++ b/src/refresh/shader.c
+@@ -1039,7 +1039,9 @@
+ 
+         const dlight_t *dl = &glr.fd.dlights[n];
+ 
+-        if (GL_CullSphere(dl->sphere, dl->sphere[3]) == CULL_OUT) {
++        // [vr overlay 0033] GL_CullSphere scaled this radius by glr.entscale — a leftover
++        // from the previous render's last entity, and a DIFFERENT leftover in each eye.
++        if (GL_CullLightSphere(dl->sphere, dl->sphere[3]) == CULL_OUT) {
+             c.dlightsCulled++;
+             continue;
+         }

@@ -50,7 +50,7 @@ echo "== configuring FFmpeg for visionOS arm64 $BUILD_ENV (target $TARGET) =="
     --disable-avdevice --disable-avfilter --disable-network \
     --disable-everything \
     --enable-demuxer=ogg,idcin,wav,flac,mp3 \
-    --enable-decoder=theora,vorbis,idcinvideo,pcm_u8,pcm_s16le,flac,mp3,opus \
+    --enable-decoder=theora,vorbis,idcin,pcm_u8,pcm_s16le,flac,mp3,opus \
     --enable-parser=vorbis \
     --enable-protocol=file \
     --disable-audiotoolbox --disable-videotoolbox \
@@ -67,6 +67,20 @@ for l in libavcodec libavformat libavutil libswresample libswscale; do
     a="$PREFIX/lib/$l.a"
     if [ ! -f "$a" ]; then echo "MISSING $a"; fail=1; continue; fi
     lipo -info "$a" | grep -q arm64 || { echo "$a not arm64"; fail=1; }
+done
+# CODEC SYMBOLS, not the configure line — see the same block in build-ffmpeg-ios.sh for
+# why. Short version: FFmpeg's configure silently ignores an unknown --enable-decoder
+# name, and `idcinvideo` (the real name is `idcin`) disabled every .cin cinematic here
+# with no diagnostic at configure, build, link or runtime.
+# Symbol table read ONCE into a variable — never `nm | grep -q` under `set -o pipefail`,
+# which SIGPIPEs nm on the match and fails the pipeline on the SUCCESS path.
+SYMS="$(nm -gj "$PREFIX/lib/libavcodec.a" "$PREFIX/lib/libavformat.a" 2>/dev/null)"
+for sym in ff_ogg_demuxer ff_theora_decoder ff_vorbis_decoder \
+           ff_idcin_demuxer ff_idcin_decoder ff_pcm_u8_decoder; do
+    case $'\n'"$SYMS"$'\n' in
+        *$'\n'"_$sym"$'\n'*) ;;
+        *) echo "MISSING SYMBOL $sym — a codec name in --enable-* is wrong"; fail=1 ;;
+    esac
 done
 [ $fail -eq 0 ] || { echo "FFmpeg visionOS ($BUILD_ENV) build FAILED"; exit 1; }
 echo "FFmpeg visionOS ($BUILD_ENV) libs OK in $PREFIX/lib"

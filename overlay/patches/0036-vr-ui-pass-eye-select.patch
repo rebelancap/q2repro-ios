@@ -1,0 +1,65 @@
+Subject: [overlay 0036] q2vr.ui_only — the 2D redirect as a pass of its own
+
+R11. The 2D/HUD redirect (overlay 0023) is bracketed inside a per-EYE SCR_UpdateScreen and
+runs only while eye 0 is being rendered: `ui_draw` is eye 0 only. That makes eye 0 the one
+eye whose Metal render pass is INTERRUPTED — the UI framebuffer bind ends eye 0's pass, the
+2D stream is drawn into another target, then eye 0's colour+depth FBO is re-bound and drawn
+into again — while eye 1's pass is ended only by the glFlush in EndFrame. The reports describe a
+constant jitter in the LEFT eye on a real Vision Pro and only occasional flicker in the
+right, unchanged by render quality and sharpening, with anchor lag, ring-slot collisions and
+per-eye frustum drift all measured at zero. This asymmetry in how the two eyes' passes are
+opened and closed is the one remaining left/right difference in the code that the simulator
+cannot exercise, because a simulator compositor does not reproject a submitted depth buffer.
+
+So the shell needs to be able to move the redirect off the eyes entirely, and this is the
+one engine-side thing that takes: a third `SCR_UpdateScreen` after both eyes, drawing the 2D
+stream into the UI texture with NO eye framebuffer bound before or after it. That third call
+must NOT render a third world — `V_SuppressFrameRender` (overlay 0030) only covers
+`CL_Frame`'s own call site, not a direct one.
+
+  * `q2_vr_state_t` gains an APPENDED `ui_only` (shared.h). Appended, never inserted: the
+    shell and the engine are separate translation units that agree only by layout.
+
+  * `SCR_DrawActive` skips `V_RenderView` when it is set. Everything else about the pass is
+    unchanged — the two existing `ui_draw` brackets do the drawing, and both halves of the
+    2D stream land in the UI texture exactly as they do on eye 0 today. Zero for every other
+    configuration and for the shell's own modes 0 and 1, so the shipped path is byte-for-byte
+    what it was.
+
+Apply: patch -p1 -d vendor/q2repro < this
+--- a/inc/shared/shared.h
++++ b/inc/shared/shared.h
+@@ -1451,6 +1451,17 @@
+     // FREE WHEN OFF: the shell's copy returns 0 before it touches anything if the row is off,
+     // so the whole cost in the shipped configuration is one indirect call per 2D pass.
+     int   (*stats_text)(char *out, int size);
++
++    // [vr overlay 0036] THE 2D PASS, OFF THE EYES. Set by the shell for a THIRD
++    // SCR_UpdateScreen after both eyes have been rendered, so the whole 2D stream is drawn
++    // into the UI texture with no eye framebuffer bound on either side of it (`vr_ui_eye 2`).
++    // Without this the third call would render a third world: overlay 0030's
++    // V_SuppressFrameRender only covers CL_Frame's own SCR_UpdateScreen call site, and this
++    // one is direct. It suppresses `V_RenderView` and NOTHING else — the two `ui_draw`
++    // brackets already in screen.c do all of the drawing, unchanged.
++    //
++    // APPENDED, never inserted, for the same reason every block above it was.
++    int     ui_only;            // 1 = this SCR_UpdateScreen draws 2D only, no world
+ } q2_vr_state_t;
+ 
+ extern q2_vr_state_t q2vr;
+--- a/src/client/screen.c
++++ b/src/client/screen.c
+@@ -2172,7 +2172,12 @@
+     SCR_TileClear();
+ 
+     // draw 3D game view
+-    V_RenderView();
++    // [vr overlay 0036] ...unless this pass is the immersive shell's 2D-ONLY pass, which runs
++    // after both eyes and exists so the redirect is not hosted inside one eye's render (see
++    // shared.h). V_SuppressFrameRender cannot do this job: it guards CL_Frame's call site, and
++    // the shell's third SCR_UpdateScreen is a direct call.
++    if (!(q2vr.active && q2vr.ui_only))
++        V_RenderView();
+ 
+     // [vr overlay R2] The HUD half of the 2D redirect (charter D6). The world has just been
+     // drawn into the EYE target; everything from here on is 2D and belongs on the UI texture,

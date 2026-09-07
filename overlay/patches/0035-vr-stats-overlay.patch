@@ -1,0 +1,90 @@
+[vr overlay R10] The VR Stats block — the headset's own instrument panel.
+
+There have been reports of "world jitter" from a Vision Pro across four rounds and every
+round has been argued from source, because the port has NO device measurement:
+there is no console in the headset, the log is unreadable there, and the numbers
+that decide the question (publish lag, how often a compositor frame presents the
+SAME pair again, the per-eye frustum drift the composite assumes is zero, memory)
+all live on the compositor side.
+
+This adds the one hook that makes them readable from inside the headset: a shell-
+installed function pointer that copies a newline-separated block of text, and a
+draw of it in the top-left of the redirected 2D pass, with the engine's own font.
+
+  * NOT the notify feed (D-VR-R7b). Notify lines scroll, expire, and share a
+    surface with the game's own messages; an instrument that competes with "you
+    got the shotgun" is an instrument nobody can read.
+  * NOT a cvar, either: the row is a settings toggle (vr_stats, default OFF) so a
+    player with no keyboard can turn it on, and OFF costs one indirect call per
+    2D pass — the copy returns 0 before it touches its buffer.
+  * Top-left, because the crosshair is centred and the status bar is along the
+    bottom, so this corner is the one that costs the player nothing.
+
+The field appends to q2_vr_state_t, never inserts: the shell and the engine are
+separate translation units that agree on that struct only by layout.
+
+--- a/inc/shared/shared.h
++++ b/inc/shared/shared.h
+@@ -1430,6 +1430,27 @@
+     float   dot_pts[5][3];      // WRITTEN BY THE ENGINE: world points, centre first
+     float   dot_half[5];        // WRITTEN BY THE ENGINE: half-extent of each, world units
+     int     dot_npts;           // WRITTEN BY THE ENGINE: how many of them are live
++
++    // [vr overlay R10] THE STATS BLOCK. APPENDED, never inserted, for the seventh time.
++    //
++    // A headset session has no console and no log: the player is in a Vision Pro with a gamepad,
++    // and every number that decides the jitter question — the publish lag, the fraction of
++    // compositor frames that presented the SAME pair again, the per-eye frustum drift, the
++    // memory — lives on the compositor side and has never been readable from inside the
++    // headset. This is the one hook that makes it readable: a function POINTER installed by
++    // the platform shell (like `ui_begin`/`ui_end`, so no shell-less configuration needs a
++    // stub to link) that copies at most `size` bytes of a newline-separated block into the
++    // caller's buffer and returns 0 when there is nothing to draw.
++    //
++    // IT IS NOT THE NOTIFY FEED, deliberately (D-VR-R7b). Text pushed through Com_Printf
++    // reaches the player as notify lines, which scroll, expire, and share a surface with the
++    // game's own messages; an instrument that competes with "you got the shotgun" is an
++    // instrument nobody can read. This draws itself, in the top-left of the redirected 2D
++    // pass, where it covers neither the crosshair (centre) nor the status bar (bottom).
++    //
++    // FREE WHEN OFF: the shell's copy returns 0 before it touches anything if the row is off,
++    // so the whole cost in the shipped configuration is one indirect call per 2D pass.
++    int   (*stats_text)(char *out, int size);
+ } q2_vr_state_t;
+ 
+ extern q2_vr_state_t q2vr;
+--- a/src/client/screen.c
++++ b/src/client/screen.c
+@@ -2113,6 +2113,32 @@
+     SCR_DrawDebugStats();
+     SCR_DrawDebugPmove();
+ #endif
++
++    // [vr overlay R10] THE VR STATS BLOCK, drawn LAST so nothing above it can paint over the
++    // one readout a headset session has. Top-left of the HUD's own coordinate space: the
++    // crosshair is centred and the status bar is along the bottom, so this corner is the one
++    // that costs the player nothing. The shell owns the text (it is the only side that can see
++    // the publish lag and the frustum deltas); this owns nothing but the placement.
++    if (q2vr.active && q2vr.stats_text) {
++        char sbuf[512];
++        if (q2vr.stats_text(sbuf, sizeof(sbuf))) {
++            // One fill behind the whole block rather than one per line: a per-line fill leaves
++            // a comb of gaps that reads as noise over a bright wall, which is exactly the
++            // surface a Quake II corridor is made of.
++            int lines = 1, wide = 0, col = 0;
++            for (const char *c = sbuf; *c; c++) {
++                if (*c == '\n') { if (col > wide) wide = col; col = 0; lines++; }
++                else col++;
++            }
++            if (col > wide) wide = col;
++            const int x = CONCHAR_WIDTH * 2, y = CONCHAR_HEIGHT * 2;
++            R_DrawFill32(x - CONCHAR_WIDTH / 2, y - CONCHAR_HEIGHT / 4,
++                         CONCHAR_WIDTH * wide + CONCHAR_WIDTH,
++                         CONCHAR_HEIGHT * lines + CONCHAR_HEIGHT / 2,
++                         COLOR_RGBA(0, 0, 0, 176));
++            R_DrawString(x, y, UI_MULTILINE, sizeof(sbuf), sbuf, COLOR_WHITE, scr.font_pic);
++        }
++    }
+ 
+     R_SetScale(1.0f);
+ }

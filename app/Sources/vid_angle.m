@@ -22,6 +22,8 @@
 #include "client/video.h"
 #include "refresh/refresh.h"
 
+extern void Q2_VR_ConPrintf(const char *fmt, ...) q_printf(1, 2);   // [R7b 8a]
+
 #ifndef EGL_PLATFORM_ANGLE_ANGLE
 #define EGL_PLATFORM_ANGLE_ANGLE 0x3202
 #endif
@@ -31,6 +33,11 @@
 #ifndef EGL_PLATFORM_ANGLE_TYPE_METAL_ANGLE
 #define EGL_PLATFORM_ANGLE_TYPE_METAL_ANGLE 0x3489
 #endif
+
+// Declared in inc/client/client.h, which this file does not include (it drags the whole
+// client in). Without the prototype clang treats the call as an implicit declaration —
+// caught by scripts/ios-syntax-check.sh / vr-syntax-check.sh.
+extern void SCR_ModeChanged(void);
 
 #if defined(Q2_XR_UI) && Q2_XR_UI
 extern int q2_xr3_mode;            // xr3_glue.m: 1 while the engine renders the stereo eyes
@@ -56,7 +63,16 @@ void VID_iOS_SetLayer(void *layer) { s_layer = (__bridge CALayer *)layer; }
 void VID_iOS_RequestCapture(const char *path) { (void)path; }   // not needed for the perf run
 static float s_look_dx, s_look_dy;
 void VID_iOS_AddLook(float dx, float dy) { s_look_dx += dx; s_look_dy += dy; }
-void VID_iOS_Command(const char *cmd) { Cmd_ExecuteString(&cmd_buffer, cmd); }
+// Console commands from the shell. While a dedicated engine thread owns the frame (VR),
+// Cmd_ExecuteString would run arbitrary engine code on whatever thread called us — the
+// settings sheet's MainActor, a scene handler, a UIKit gesture. Route through the producer
+// funnel in ios_bridge.m, which executes it at the top of the next engine frame in order.
+extern int  Q2_iOS_ShouldDefer(void);
+extern void Q2_iOS_QueueCommand(const char *cmd);
+void VID_iOS_Command(const char *cmd) {
+    if (Q2_iOS_ShouldDefer()) { Q2_iOS_QueueCommand(cmd); return; }
+    Cmd_ExecuteString(&cmd_buffer, cmd);
+}
 
 // --- vid_driver_t ------------------------------------------------------------
 static bool a_probe(void) { return true; }
@@ -71,7 +87,9 @@ static void a_force_srgb(void) {
     CAMetalLayer *ml = (CAMetalLayer *)s_layer;
     CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
     ml.colorspace = cs;
-    ml.wantsExtendedDynamicRangeContent = NO;
+    // Guarded: the deployment target is iOS 15, where this selector does not exist
+    // (unrecognized-selector crash). Off is the default there anyway, so nothing is lost.
+    if (@available(iOS 16.0, visionOS 1.0, *)) ml.wantsExtendedDynamicRangeContent = NO;
     CGColorSpaceRelease(cs);
 }
 
@@ -158,6 +176,18 @@ static void  a_update_gamma(const byte *t) { (void)t; }
 static void *a_get_proc_addr(const char *s) { return (void *)eglGetProcAddress(s); }
 // Re-pin sRGB every frame: iOS/ANGLE can reset the CAMetalLayer's colorspace to nil (native/
 // unmanaged) after init — on the P3 panel that reads as oversaturated. Idempotent + cheap.
+// [R7a item 12] Counted, because "the 2D window is frozen" had no machine-readable signal
+// at all: the display link ticked, Qcommon_Frame ran, the mixer was pumped, and the ONLY
+// thing that had stopped was this call succeeding. `swapok` advancing after a VR exit is the
+// assertion that the picture is moving again — and it is one a simulator can make, which a
+// screenshot of an immersive space never is.
+static unsigned long long s_swap_ok, s_swap_fail;
+void VID_iOS_ANGLE_SwapStats(unsigned long long *ok, unsigned long long *fail)
+{
+    if (ok) *ok = s_swap_ok;
+    if (fail) *fail = s_swap_fail;
+}
+
 static void  a_swap_buffers(void) {
 #if defined(Q2_XR_UI) && Q2_XR_UI
     // 3D mode: the engine renders offscreen; never present to (or block on) the hidden
@@ -165,7 +195,8 @@ static void  a_swap_buffers(void) {
     // (GPU flushing happens in VID_iOS_XR3_EndFrame, in the UIKit-free glue file.)
     if (q2_xr3_mode) return;
 #endif
-    a_force_srgb(); eglSwapBuffers(s_dpy, s_surf);
+    a_force_srgb();
+    if (eglSwapBuffers(s_dpy, s_surf)) s_swap_ok++; else s_swap_fail++;
 }
 static void  a_swap_interval(int v) { eglSwapInterval(s_dpy, v); }
 static char *a_sel(void) { return NULL; }
@@ -194,6 +225,72 @@ const vid_driver_t vid_angle = {
 // transitive OpenGLES import shadows ANGLE's GL prototypes as 'unavailable' on visionOS).
 // The glue needs the window's pixel size to restore the render size on 3D exit.
 void VID_iOS_XR3_GetWindowSize(int *w, int *h) { *w = s_width; *h = s_height; }
+
+// ---- ANGLE context ownership (the prerequisite for a dedicated engine thread) --------
+// The EGL context is made current on the MAIN thread inside Qcommon_Init (a_init) and
+// re-bound on main by a_set_mode, and every GL call in this app has so far come from the
+// main-thread display link. An EGL context may be current on at most ONE thread, so moving
+// frame ownership to an engine thread is not "spawn a thread and call Qcommon_Frame": the
+// context must be released by main FIRST and acquired by the new owner SECOND, with no
+// window in between where both believe they hold it.
+//
+// These two calls are the whole handover, and they are deliberately dumb: the ORDERING
+// lives in the VR entry/exit sequence (q2_vr_glue.m), in one place, so it can be read.
+// A release that races an in-flight frame is a GPU fault with no stack, so the engine
+// thread is always stopped and joined-by-poll before main takes the context back.
+void VID_iOS_ANGLE_ReleaseContext(void)
+{
+    if (s_dpy == EGL_NO_DISPLAY) return;
+    if (!eglMakeCurrent(s_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT))
+        Com_EPrintf("vid_angle: release context failed 0x%x\n", eglGetError());
+}
+
+bool VID_iOS_ANGLE_AcquireContext(void)
+{
+    if (s_dpy == EGL_NO_DISPLAY || s_ctx == EGL_NO_CONTEXT) return false;
+    // Surfaceless is correct here: in VR (and in 3D) the engine renders into FBOs wrapping
+    // app-owned Metal textures and never presents to the hidden window surface, which
+    // a_swap_buffers already refuses to touch. Binding the window surface from a non-main
+    // thread is exactly the hidden-drawable acquire that can stall forever.
+    EGLSurface surf = q2_xr3_mode ? EGL_NO_SURFACE : s_surf;
+    if (!eglMakeCurrent(s_dpy, surf, surf, s_ctx)) {
+        Com_EPrintf("vid_angle: acquire context failed 0x%x\n", eglGetError());
+        return false;
+    }
+    return true;
+}
+
+// [R7a, Q-VR8 item 12] THE STEP THAT WAS MISSING FROM EVERY VR EXIT.
+//
+// The exit finalize took the context back on main by calling AcquireContext from INSIDE
+// Q2_VR_FinishEngineStop, which runs BEFORE VID_iOS_XR3_SetMode(0) clears q2_xr3_mode. So
+// the ternary above chose EGL_NO_SURFACE and main came back SURFACELESS — for the rest of
+// the process's life, because nothing else ever re-binds s_surf. The display link resumed,
+// Qcommon_Frame ran, the mixer was pumped (music kept playing, which is the tell), and
+// every eglSwapBuffers failed against a surface that was not current: the 2D window froze
+// on the entry frame. The self-heal that would have caught it, VID_iOS_Resize, early-returns
+// while q2_xr3_mode is set and the un-park resize is issued before the dismissal, so by the
+// time mode is off the size matches and it bails.
+//
+// Ordering is the whole fix, so it is a NAMED call rather than a second Acquire whose
+// correctness depends on a flag set three lines earlier in a different file. It is called
+// from the `off` branch of VID_iOS_XR3_SetMode, before that branch's GL calls, so every path
+// that reaches the finalize — ordinary exit, failed-entry rollback, the Digital Crown belt —
+// gets it, and it reports the OUTCOME (donors' L-6: a request is not an outcome).
+bool VID_iOS_ANGLE_BindWindowSurface(void)
+{
+    if (s_dpy == EGL_NO_DISPLAY || s_ctx == EGL_NO_CONTEXT) return false;
+    if (s_surf == EGL_NO_SURFACE) {
+        Com_EPrintf("vid_angle: no window surface to bind\n");
+        return false;
+    }
+    if (!eglMakeCurrent(s_dpy, s_surf, s_surf, s_ctx)) {
+        Com_EPrintf("vid_angle: bind window surface failed 0x%x\n", eglGetError());
+        return false;
+    }
+    Q2_VR_ConPrintf("SURFACEBIND window=1 draw=%p\n", (void *)s_surf);   // [R7b 8a] never notify
+    return true;
+}
 #endif // Q2_XR_UI
 
 #endif // Q2_USE_ANGLE

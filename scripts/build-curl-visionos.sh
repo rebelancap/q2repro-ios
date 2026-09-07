@@ -36,7 +36,7 @@ rm -rf "build-xros-$BUILD_ENV"
 echo "== configuring libcurl for visionOS arm64 $BUILD_ENV (SecureTransport, HTTP-only) =="
 cmake -B "build-xros-$BUILD_ENV" -G "Unix Makefiles" \
     -DCMAKE_SYSTEM_NAME=visionOS \
-    "${SYSROOT_ARGS[@]}" \
+    ${SYSROOT_ARGS[@]+"${SYSROOT_ARGS[@]}"} \
     -DCMAKE_OSX_ARCHITECTURES=arm64 \
     -DCMAKE_OSX_DEPLOYMENT_TARGET="$MIN_XROS" \
     -DCMAKE_INSTALL_PREFIX="$PREFIX" \

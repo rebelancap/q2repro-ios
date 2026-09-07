@@ -1,0 +1,219 @@
+Subject: [overlay 0042] when the shadow lights fit, admit them all — the cull is the over-cap path
+
+Reported in the headset on 1.0.11.22 (rerelease data, base1, per-pixel lighting, VR): "Right at
+the beginning of base1, at this wall, if I stand right in this spot it's LIGHT in my left eye,
+DARK in my right eye. If I move to the left it's bright in both eyes, if I move to the right
+it's dark in both eyes. This kind of thing is all over the place — walls, floors, etc."
+
+0041 removed the SERVER's position cull (PHS against the light's own zero-size leaf) and put a
+client-side relevance cull in its place: keep a light iff its bounding sphere touches a leaf in
+the view leaf's PVS. Better question, same SHAPE of answer — a hard, position-dependent step.
+And the q2repro per-pixel light shader has NO occlusion term: a light in the adjoining leaf
+lights the near face of the thin wall between them, and the desktop reference shows that light,
+because the PHS sent it. So a light the PVS test drops can still have been painting visible
+pixels one step earlier. That is the both-eyes half of the report.
+
+On base1 the cull is additionally doing no useful work. R18 measured it: 37 shadow lights
+defined, all 37 sent every frame after 0041, the relevance cull admitting 24-33 of them
+depending on where you stand, and ZERO evictions — the 64-slot MAX_DLIGHTS cap is never
+reached. It was removing 4 to 13 lights the array had room for, at a position threshold.
+
+WHAT THIS PATCH DOES
+
+  A. CL_AddShadowLights becomes two passes. Pass 1 counts what the server sent this frame.
+     If that count fits the budget, the frame runs in ADMIT-ALL mode: no relevance test at
+     all, every sent light goes to V_AddLightEx. Only when the sent set exceeds the budget
+     does 0041's cull run — which is what it should always have been, a way to choose what to
+     lose when they cannot all be kept, not a permanent filter. 0041's code is untouched on
+     that path (relevance, then the intensity x lightstyle x fade x proximity ranking at the
+     cap).
+
+  B. The budget is MAX_DLIGHTS minus the lights already in r_dlights minus a reserve of 8,
+     via a new V_ShadowLightBudget() in view.c (r_numdlights and the slot bookkeeping live
+     there, so the arithmetic does too). By the time CL_AddShadowLights runs, every transient
+     effect light of the frame is ALREADY counted — CL_AddEntities calls CL_AddPacketEntities
+     (muzzle flashes, item glows, rocket and BFG trails), CL_AddTEnts (explosions) and
+     CL_AddDLights before it — so the subtraction is exact, not an estimate. The reserve
+     covers LOC_AddLocationsToScene, the one V_AddLight caller that runs AFTER us (locs.c,
+     under cl_drawlocs), plus headroom against a future stage being added after this one and
+     silently starved. 8 of 64 is 12.5%: base1's 37 never come near it, and a map dense
+     enough to need the cull path is exactly the map that gets it.
+
+  C. The PVS row (V_UpdateShadowLightVis) is now decompressed only on the cull path — pure
+     cost when nothing is going to be culled.
+
+  D. SHADOWDIAG gains `mode=admit-all|cull budget=N`. The existing fields are unchanged and
+     in the same order, so artifacts/vr-r18/analyze.py parses both builds. In admit-all mode
+     `relevant` equals `sentbyserver` by construction (nothing is tested).
+
+WHY THIS CANNOT BE THE PER-EYE HALF OF THE REPORT
+
+The client's selection is EYE-INDEPENDENT, and this is worth stating because R19's second item
+is the per-eye split. Every position input to the selection — V_ShadowLightRelevant's view
+leaf, V_AddLightEx's fade and proximity — reads cl.refdef.vieworg at CL_AddShadowLights time,
+and CL_AddShadowLights runs from CL_AddEntities, which runs after CL_CalcViewValues and BEFORE
+view.c's per-eye pose injection. So cl.refdef.vieworg is the PRE-VR body origin at this point:
+both eyes of a frame select the identical light set from the identical origin. R18 confirmed
+it in the numbers (eyesplit 0/1816 publish pairs). A light lit in one eye and dark in the other
+therefore arises downstream, in the refresh — that is diagnosed separately.
+
+Nothing in the shader, the dlight mask, or 0031/0039/0040's stamp logic is touched. Upstream
+defect, upstreamable as-is; a flat desktop takes the same path.
+
+Apply: patch -p1 -d vendor/q2repro < this
+--- a/src/client/client.h
++++ b/src/client/client.h
+@@ -930,6 +930,9 @@
+ // once per frame (after cl.refdef.vieworg is set), then test each light.
+ void V_UpdateShadowLightVis(void);
+ bool V_ShadowLightRelevant(const cl_shadow_light_t *light);
++// [vr overlay 0042] how many r_dlights slots CL_AddShadowLights may still fill this frame
++// (MAX_DLIGHTS minus the lights already added minus a reserve). See view.c.
++int V_ShadowLightBudget(void);
+ extern int r_shadowlight_evictions;
+ void V_AddLight(const vec3_t org, float intensity, float r, float g, float b);
+ void V_AddLightStyle(int style, float value);
+--- a/src/client/view.c
++++ b/src/client/view.c
+@@ -250,6 +250,31 @@
+     return false;
+ }
+ 
++// [vr overlay 0042] HOW MANY r_dlights SLOTS ARE STILL AVAILABLE TO SHADOW LIGHTS.
++//
++// CL_AddShadowLights needs this to decide whether it can admit every light the server sent
++// without culling anything (see effects.c). r_numdlights lives here, not in effects.c, and
++// so does the knowledge of who owns which slot — so the budget is computed here.
++//
++// The RESERVE. By the time CL_AddShadowLights runs, every transient effect light of the
++// frame is already in the array: CL_AddEntities calls CL_AddPacketEntities (muzzle flashes,
++// item glows, rocket/BFG trails), CL_AddTEnts (explosions) and CL_AddDLights (cl_dlights,
++// the timed ones) BEFORE it, so r_numdlights already counts them exactly. The reserve is
++// therefore not for them; it is for
++//   * LOC_AddLocationsToScene, the one V_AddLight caller that runs AFTER us (locs.c, under
++//     cl_drawlocs) — without a reserve its lights would be silently squeezed out, and
++//   * headroom against upstream drift, since a future stage added after CL_AddShadowLights
++//     would otherwise be starved by a full array with no diagnostic.
++// Eight slots is 12.5% of MAX_DLIGHTS, which base1's 37 shadow lights never come near, and
++// small enough that a map dense enough to need the cull path is the map that gets it.
++#define V_SHADOWLIGHT_RESERVE   8
++
++int V_ShadowLightBudget(void)
++{
++    int budget = MAX_DLIGHTS - r_numdlights - V_SHADOWLIGHT_RESERVE;
++    return max(budget, 0);
++}
++
+ // calculate the fade distance from screen to light
+ static inline float fade_distance_to_light(const vec2_t fade, const vec3_t light_origin, const vec3_t org)
+ {
+--- a/src/client/effects.c
++++ b/src/client/effects.c
+@@ -1857,19 +1857,59 @@
+ {
+     // [vr overlay 0041] SHADOWDIAG counters, see the print at the end of this function
+     int total = 0, sent = 0, relevant = 0, admitted = 0;
++    // [vr overlay 0042] "admit-all" = the lights the server sent this frame all fit in the
++    // slots left over, so nothing is culled at all. See the block below.
++    bool admit_all;
++    int budget;
+ 
+     if (!cl_shadowlights->integer || !R_SupportsPerPixelLighting())
+         return;
+ 
+-    // [vr overlay 0041] one PVS row per frame for the relevance cull below
+-    V_UpdateShadowLightVis();
+-
++    // [vr overlay 0042] PASS 1 — count only. WHAT THE SERVER SENT FITS, SO ADMIT ALL OF IT.
++    //
++    // 0041 stopped the server position-culling shadow lights and moved the culling to the
++    // client, where the light's RADIUS is known: V_ShadowLightRelevant keeps a light only if
++    // its bounding sphere touches a leaf in the VIEW LEAF'S PVS. That is a better question
++    // than the server's PHS-of-the-light's-own-leaf, but it is still a HARD, POSITION
++    // DEPENDENT STEP — and the q2repro per-pixel light shader has no occlusion term at all.
++    // A light in the next room lights the near face of the thin wall between, and the desktop
++    // reference (where the PHS sent it) shows exactly that. So a light dropped by the PVS test
++    // can still have been contributing visible pixels a step earlier: cross the leaf boundary
++    // and the wall in front of you steps dark, which is precisely what the report describes at the
++    // riveted panel near base1's spawn ("light here, dark one step to the right").
++    //
++    // On base1 that cull is also doing NO USEFUL WORK: the map defines 37 shadow lights, all
++    // 37 are now sent every frame (R18 measured it), the cull admits 24-33 of them, and the
++    // 64-slot MAX_DLIGHTS cap is never reached (0 evictions). It removes lights the array had
++    // room for. So: if everything the server sent fits in the budget, cull NOTHING. The
++    // relevance cull becomes what it should always have been — the OVER-CAP path, a way to
++    // choose which lights to lose when they cannot all be kept, not a permanent filter.
++    //
++    // Cost of admitting all: one dlight_t slot and one shader light per extra light. The
++    // per-pixel path already loops over r_numdlights, so the ceiling is MAX_DLIGHTS either
++    // way; admit-all merely uses the slots that were being left empty.
+     for (size_t i = 0; i < cl.csr.max_shadowlights; i++) {
+         if (!*cl.configstrings[cl.csr.shadowlights + i])
+             continue;
+-
+         total++;
++        if (cl_entities[cl.shadowdefs[i].number].serverframe != cl.frame.number)
++            continue;
++        sent++;
++    }
+ 
++    budget = V_ShadowLightBudget();
++    admit_all = (sent <= budget);
++
++    // [vr overlay 0041] one PVS row per frame for the relevance cull below. Only needed on
++    // the cull path — the PVS decompression is pure cost when nothing is going to be culled.
++    if (!admit_all)
++        V_UpdateShadowLightVis();
++
++    // PASS 2 — the lights themselves.
++    for (size_t i = 0; i < cl.csr.max_shadowlights; i++) {
++        if (!*cl.configstrings[cl.csr.shadowlights + i])
++            continue;
++
+         centity_t *ent = &cl_entities[cl.shadowdefs[i].number];
+ 
+         // The entity still gates the light: the game turns lights on and off with
+@@ -1879,8 +1919,6 @@
+         if (ent->serverframe != cl.frame.number)
+             continue;
+ 
+-        sent++;
+-
+         color_t color;
+         if (!ent->current.skinnum)
+             color = COLOR_WHITE;
+@@ -1892,10 +1930,10 @@
+         VectorCopy(ent->current.origin, cl.shadowdefs[i].light.origin);
+         cl.shadowdefs[i].light.color = color;
+ 
+-        // [vr overlay 0041] base1 defines 143 shadow lights against a 64-slot cap, so the
+-        // client does the culling the server used to do badly — by the light's own volume
+-        // against the view PVS, not by the light's leaf against the view PHS.
+-        if (!V_ShadowLightRelevant(&cl.shadowdefs[i].light))
++        // [vr overlay 0042] the cull is the over-cap path only (see above). When it does run,
++        // it is 0041's: relevance by the light's own volume against the view PVS, then
++        // V_AddLightEx's intensity x lightstyle x fade x proximity ranking at the cap.
++        if (!admit_all && !V_ShadowLightRelevant(&cl.shadowdefs[i].light))
+             continue;
+ 
+         relevant++;
+@@ -1908,12 +1946,16 @@
+     // LIGHTALIAS lines so one cvar turns the whole light pipeline's diagnostics on:
+     //   total        shadow lights defined by the map (configstrings)
+     //   sentbyserver received in this server frame (i.e. not switched off)
+-    //   relevant     whose bounding sphere touches the view PVS
++    //   relevant     whose bounding sphere touches the view PVS (== sentbyserver in
++    //                admit-all mode, where nothing is tested)
+     //   admitted     that actually got an r_dlights slot
+     //   evicted      admitted lights that later lost their slot at the cap
++    // [vr overlay 0042] mode=admit-all|cull and the budget that decided it.
+     if (cl_lightdiag->integer)
+-        Com_Printf("SHADOWDIAG total=%d sentbyserver=%d relevant=%d admitted=%d evicted=%d\n",
+-                   total, sent, relevant, admitted, r_shadowlight_evictions);
++        Com_Printf("SHADOWDIAG total=%d sentbyserver=%d relevant=%d admitted=%d evicted=%d "
++                   "mode=%s budget=%d\n",
++                   total, sent, relevant, admitted, r_shadowlight_evictions,
++                   admit_all ? "admit-all" : "cull", budget);
+ }
+ 
+ /*

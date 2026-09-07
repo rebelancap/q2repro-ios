@@ -1,0 +1,246 @@
+Subject: [overlay 0039] dlight priority instead of first-come, and no stale dlight bits
+
+Headset report, 1.0.11.16, rerelease data, base1, VR: "as I move my head, portions of walls
+and floors switch between a lighter and a darker version; turning off dynamic lighting fixes
+it." 0037 fixed the 64-bit mask defect; this is what was left. Diagnosis (read-only, file:line
+verified): artifacts/vr-r14/DIAG-wall-lighting-r14.md. Two mechanisms, BOTH upstream defects
+with nothing stereo about them — a flat desktop with the rerelease data has them too. VR only
+makes them constant, because head POSITION moves every frame there and a mouse-look desk
+player's does not.
+
+M-A — src/client/view.c: MAX_DLIGHTS is a FIRST-COME cap.
+MAX_SHADOW_LIGHTS is 256 (inc/shared/shared.h) and MAX_DLIGHTS is 64 (inc/refresh/refresh.h).
+CL_AddShadowLights walks the shadowlight configstrings in configstring order calling
+V_AddLightEx, whose first statement was `if (r_numdlights >= MAX_DLIGHTS) return;`. The
+per-light distance fade a few lines below is a function of cl.refdef.vieworg and returns 0
+past fade_end, at which point that light does not take a slot. Move the head a few
+centimetres, a faded light crosses zero, frees its slot, and the next configstring light that
+previously did not fit is admitted AT FULL INTENSITY. That is a step from nothing to
+everything, in both directions, and it is exactly "the wall has a lighter and a darker
+version". Fix: keep the 64 STRONGEST (intensity * lightstyle * fade) rather than the 64 that
+came first — when the array is full, evict the weakest entry if the candidate beats it, else
+drop the candidate. The light that loses is then always the one already contributing least,
+so the step lands where it cannot be seen. Only slots V_AddLightEx itself owns are eligible
+for eviction: V_AddLight's entries (muzzle flashes, rockets, explosions) put a radius in
+dl->radius and a flat 1.0 in dl->intensity, so their weight is not comparable and a static
+map light must never take a muzzle flash's slot. Cost: one float compare per light, a
+64-entry rescan on the rare eviction, zero GPU cost.
+
+M-B — src/refresh/tess.c: surf->dlightbits is consumed with no stamp check, and under
+per-pixel lighting nothing ever clears it.
+GL_DrawFace did `tess.dlight_bits |= surf->dlightbits;` unconditionally. Those bits are
+indices into glr.fd.dlights[] for the CURRENT render only. world.c clears them only on a
+re-mark (GL_MarkLights_r, and only for faces some light actually visits); GL_PushLights
+returns before update_dynamic_lightmap for dlight reasons under ppl (upstream guard); and
+overlay 0031 deliberately stopped clearing them in update_dynamic_lightmap under ppl, because
+there they are the frame's shader light list rather than a lightmap companion. So a face lit
+once — a blaster flash, a shadowlight walked past — carried those bits forever, while M-A and
+the fade renumber the dlights array every frame: a stale bit ends up naming a completely
+different light. The batch union then injects that light into the UBO for every face sharing
+texture+state, and the union's contents change with the view.
+
+Fix: honour surf->dlightframe, which GL_MarkLights_r already maintains beside the bits. Three
+hunks are needed for that to be correct rather than merely quiet:
+
+  * tess.c GL_DrawFace — the gate itself.
+  * world.c GL_DrawBspModel — GL_TransformLights bumps glr.dlightframe once per inline
+    bmodel, and R_RenderFrame runs GL_DrawEntities before GL_DrawAlphaFaces. World alpha
+    faces carry the world's stamp but would be drawn after it had moved on, so they would
+    fail the gate and silently lose all dynamic light. Save the world stamp, restore it after
+    the model is flushed, and hand it to the bmodel's own deferred alpha faces as they are
+    added (the bits index the same array either way; only the stamp differs).
+  * surf.c update_dynamic_lightmap — 0031 left the bits alone under ppl but still zeroed the
+    stamp. Now that the bits are gated on the stamp, that zero would drop the dynamic lights
+    of any ppl face that merely had a lightstyle change this frame, which is the one route by
+    which GL_PushLights still reaches this function under ppl. Stamp and bits are one value;
+    under ppl neither belongs to this function.
+
+Cost: one comparison per face, and likely a small win — fewer lights per batch means fewer
+dlight UBO uploads.
+
+Not done here, deliberately: widening the mask past 64 (uint64_t -> two words, BIT_ULL -> a
+helper, touching gl.h/world.c/surf.c/mesh.c/tess.c/shader.c and doubling the dlight UBO). That
+is the correct long-term fix for M-A and is a round of its own; the priority cap makes the
+current 64 behave sanely first.
+
+Composes with 0031 (repeat-frame lighting idempotence — this makes its ppl carve-out
+consistent on both sides) and 0033 (eye-independent dlight cull — untouched).
+Both fixes are upstreamable as-is.
+
+Apply: patch -p1 -d vendor/q2repro < this
+
+--- a/src/client/view.c
++++ b/src/client/view.c
+@@ -80,6 +80,13 @@
+ int         r_numdlights;
+ dlight_t    r_dlights[MAX_DLIGHTS];
+ 
++// [vr overlay 0039] MAX_DLIGHTS is a PRIORITY cap for shadowlights, not a first-come cap.
++// These track which r_dlights slots V_AddLightEx owns and which of them is currently the
++// weakest, so a stronger candidate can evict the weakest instead of being dropped.
++static int  r_shadowlight_slots[MAX_DLIGHTS];
++static int  r_num_shadowlight_slots;
++static int  r_weakest_shadowlight = -1;
++
+ int         r_numentities;
+ entity_t    r_entities[MAX_ENTITIES];
+ 
+@@ -100,6 +107,9 @@
+     r_numdlights = 0;
+     r_numentities = 0;
+     r_numparticles = 0;
++    // [vr overlay 0039] the shadowlight priority bookkeeping is per-scene, like the arrays
++    r_num_shadowlight_slots = 0;
++    r_weakest_shadowlight = -1;
+ }
+ 
+ /*
+@@ -185,18 +195,52 @@
+ {
+     dlight_t    *dl;
+ 
+-    if (r_numdlights >= MAX_DLIGHTS)
+-        return;
+-    
+     float fade = fade_distance_to_light((const vec2_t) { light->fade_start, light->fade_end }, light->origin, cl.refdef.vieworg);
+ 
+     if (fade <= 0.0f)
+         return;
+ 
+-    dl = &r_dlights[r_numdlights++];
++    // [vr overlay 0039] The weight this light would carry if it were admitted. Identical to
++    // the dl->intensity that used to be computed below, hoisted so it can be compared with
++    // the weights already in the array.
++    float weight = light->intensity * (light->lightstyle == -1 ? 1.0f : r_lightstyles[light->lightstyle].white) * fade;
++
++    // [vr overlay 0039] PRIORITY, NOT FIRST COME. MAX_SHADOW_LIGHTS is 256 and MAX_DLIGHTS is
++    // 64, so a rerelease map (base1) offers more shadowlights than the array holds.
++    // CL_AddShadowLights walks them in CONFIGSTRING order, so the old `if (r_numdlights >=
++    // MAX_DLIGHTS) return;` kept whichever 64 happened to come first. The fade above is
++    // view-POSITION dependent: move the head a few centimetres, one light crosses fade <= 0
++    // and frees its slot, and the next configstring light that previously did not fit is
++    // admitted AT FULL INTENSITY — a step from nothing to everything, not a ramp. Walls and
++    // floors inside that light's radius therefore switch between a lighter and a darker
++    // version as the player moves, which in VR happens continuously.
++    //
++    // Selecting the 64 STRONGEST instead makes the light that gets dropped the one already
++    // contributing least, so the step happens where it is invisible. Cost: one float compare
++    // per light, plus a 64-entry rescan on the rare eviction. Zero GPU cost. Upstream bug,
++    // upstreamable as-is.
++    if (r_numdlights < MAX_DLIGHTS) {
++        if (r_weakest_shadowlight < 0 || weight < r_dlights[r_weakest_shadowlight].intensity)
++            r_weakest_shadowlight = r_numdlights;
++        r_shadowlight_slots[r_num_shadowlight_slots++] = r_numdlights;
++        dl = &r_dlights[r_numdlights++];
++    } else {
++        // Only slots this function owns may be evicted: V_AddLight's entries (muzzle flashes,
++        // rockets, explosions) store a radius in dl->radius and a flat 1.0 in dl->intensity,
++        // so their intensity is not comparable and they must never lose their slot to a
++        // static map light.
++        if (r_weakest_shadowlight < 0 || weight <= r_dlights[r_weakest_shadowlight].intensity)
++            return;
++        dl = &r_dlights[r_weakest_shadowlight];
++        dl->intensity = weight;     // so the rescan below weighs the replacement, not the evictee
++        for (int i = 0; i < r_num_shadowlight_slots; i++)
++            if (r_dlights[r_shadowlight_slots[i]].intensity < r_dlights[r_weakest_shadowlight].intensity)
++                r_weakest_shadowlight = r_shadowlight_slots[i];
++    }
++
+     VectorCopy(light->origin, dl->origin);
+     dl->radius = light->radius;
+-    dl->intensity = light->intensity * (light->lightstyle == -1 ? 1.0f : r_lightstyles[light->lightstyle].white) * fade;
++    dl->intensity = weight;
+     dl->color[0] = light->color.r / 255.f;
+     dl->color[1] = light->color.g / 255.f;
+     dl->color[2] = light->color.b / 255.f;
+--- a/src/refresh/tess.c
++++ b/src/refresh/tess.c
+@@ -930,7 +930,22 @@
+     c.facesTris += numtris;
+     c.facesDrawn++;
+ 
+-    tess.dlight_bits |= surf->dlightbits;
++    // [vr overlay 0039] STAMP-GATE THE CONSUMER. surf->dlightbits is a bitmask of indices
++    // into glr.fd.dlights[] for THIS render only, and world.c clears it solely on a re-mark
++    // (a face some light actually visits). Under per-pixel lighting the other two clear paths
++    // are dead: GL_PushLights returns before update_dynamic_lightmap for dlight reasons
++    // (surf.c, upstream ppl guard), and overlay 0031 deliberately stopped clearing the bits
++    // there because under ppl they ARE the frame's shader light list. So a face lit once — a
++    // blaster flash, a shadowlight walked past — kept those bits forever, and since the
++    // dlights array is renumbered every frame (CL_AddShadowLights order plus the fade-driven
++    // drop-outs), a stale bit names whatever light happens to occupy that slot today. Via the
++    // batch union below one stale face injects that light into the UBO for every face sharing
++    // its texture+state, and the union changes with the view — walls stepping lighter/darker
++    // as the head moves. surf->dlightframe is already maintained beside the bits by
++    // GL_MarkLights_r; honouring it costs one compare per face and tends to REDUCE the number
++    // of lights per batch. Upstream bug, upstreamable as-is.
++    if (surf->dlightframe == glr.dlightframe)
++        tess.dlight_bits |= surf->dlightbits;
+ }
+ 
+ void GL_ClearSolidFaces(void)
+--- a/src/refresh/world.c
++++ b/src/refresh/world.c
+@@ -422,6 +422,14 @@
+         }
+         VectorSubtract(glr.fd.vieworg, ent->origin, transformed);
+     }
++
++    // [vr overlay 0039] GL_TransformLights bumps glr.dlightframe, and R_RenderFrame runs
++    // GL_DrawEntities (which lands here for every inline bmodel) BEFORE GL_DrawAlphaFaces.
++    // With tess.c now gating dlightbits on the stamp, world alpha faces — stamped by
++    // GL_MarkLights with the world's number and drawn in that deferred pass — would fail the
++    // gate and silently lose every dynamic light. Restore the world's stamp after this model
++    // is flushed so the deferred pass sees the number its faces carry.
++    unsigned dlightframe_world = glr.dlightframe;
+ 
+     GL_TransformLights(model);
+ 
+@@ -451,8 +459,15 @@
+             GL_PushLights(face);
+ 
+         if (face->drawflags & SURF_TRANS_MASK) {
+-            if (model->drawframe != glr.drawframe)
++            if (model->drawframe != glr.drawframe) {
++                // [vr overlay 0039] this face is drawn later by GL_DrawAlphaFaces, after the
++                // world stamp has been restored below — hand it that stamp so the gate in
++                // GL_DrawFace still passes. The bits index the same glr.fd.dlights[] either
++                // way; only the stamp differs.
++                if (face->dlightframe == glr.dlightframe)
++                    face->dlightframe = dlightframe_world;
+                 GL_AddAlphaFace(face);
++            }
+             continue;
+         }
+ 
+@@ -466,6 +481,9 @@
+ 
+     GL_Flush3D();
+ 
++    // [vr overlay 0039] see above — the deferred alpha pass runs with the world's stamp.
++    glr.dlightframe = dlightframe_world;
++
+     // protect against infinite loop if the same inline model
+     // with alpha faces is referenced by multiple entities
+     model->drawframe = glr.drawframe;
+--- a/src/refresh/surf.c
++++ b/src/refresh/surf.c
+@@ -249,9 +249,16 @@
+         // live bits and a dead stamp got a dynamic-light contribution the lightmap under it no
+         // longer had. Under per-pixel lighting the bits ARE this frame's light list for the
+         // shader pass rather than a lightmap stamp's companion, so they are left alone there.
+-        surf->dlightframe = 0;
+-        if (!gl_backend->use_per_pixel_lighting())
++        // [vr overlay 0039] 0031 left the bits alone under ppl (there they are the frame's
++        // shader light list, not a lightmap companion) but still zeroed the stamp. Now that
++        // tess.c gates the bits ON that stamp, zeroing it here would silently drop the
++        // dynamic lights of any ppl face that merely had a LIGHTSTYLE change this frame —
++        // GL_PushLights reaches update_dynamic_lightmap by that route even under ppl. Stamp
++        // and bits are one value; under ppl neither is this function's to clear.
++        if (!gl_backend->use_per_pixel_lighting()) {
++            surf->dlightframe = 0;
+             surf->dlightbits = 0;
++        }
+     }
+ 
+     // put into texture format

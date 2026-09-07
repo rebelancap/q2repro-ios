@@ -115,6 +115,50 @@ static void q2_audio_recompute_target(void)
     q2_gain_target = t;
 }
 
+// ---- sound-stage anchoring (visionOS) --------------------------------------
+// The DESIRED mode lives here, not in the shell, because Q2_iOS_AudioApply() runs from
+// six places (driver init, foreground re-activate, four notification observers, the 4 Hz
+// drift poll, the settings picker) and every category set — plus the STOP_OTHERS
+// setActive bounce — can silently drop the spatial experience. A VR session that lost
+// .bypassed to a route change would look exactly like a VR bug.
+static int q2_spatial_want;   // Q2SpatialMode
+
+static void q2_apply_spatial(void)
+{
+#if TARGET_OS_VISION
+    AVAudioSession *s = AVAudioSession.sharedInstance;
+    NSError *err = nil;
+    AVAudioSessionSpatialExperience exp = AVAudioSessionSpatialExperienceHeadTracked;
+    AVAudioSessionSoundStageSize size = AVAudioSessionSoundStageSizeAutomatic;
+    AVAudioSessionAnchoringStrategy anchor = AVAudioSessionAnchoringStrategyAutomatic;
+    switch (q2_spatial_want) {
+    case Q2_SPATIAL_BYPASSED:
+        exp = AVAudioSessionSpatialExperienceBypassed;
+        break;
+    case Q2_SPATIAL_FRONT:
+        size = AVAudioSessionSoundStageSizeMedium;
+        anchor = AVAudioSessionAnchoringStrategyFront;
+        break;
+    default:
+        break;
+    }
+    NSDictionary *opts = (exp == AVAudioSessionSpatialExperienceBypassed) ? nil : @{
+        AVAudioSessionSpatialExperienceOptionSoundStageSize: @(size),
+        AVAudioSessionSpatialExperienceOptionAnchoringStrategy: @(anchor),
+    };
+    if (![s setIntendedSpatialExperience:exp options:opts error:&err])
+        NSLog(@"[q2repro] audio: setIntendedSpatialExperience(%d) failed: %@", q2_spatial_want, err);
+#endif
+}
+
+void Q2_iOS_SetSpatialMode(int mode)
+{
+    q2_spatial_want = mode;
+    q2_apply_spatial();
+}
+
+int Q2_iOS_SpatialMode(void) { return q2_spatial_want; }
+
 void Q2_iOS_AudioApply(void)
 {
     AVAudioSession *s = AVAudioSession.sharedInstance;
@@ -145,6 +189,7 @@ void Q2_iOS_AudioApply(void)
 
     q2_other_playing = q2_query_other_playing(s);
     q2_audio_recompute_target();
+    q2_apply_spatial();   // LAST: the category set/bounce above can drop it (SHELL-GAPS item 11)
 }
 
 void Q2_iOS_AudioBoot(void)

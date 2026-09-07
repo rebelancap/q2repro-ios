@@ -1,0 +1,72 @@
+Subject: [overlay 0030] V_SuppressFrameRender — a constant render count per host frame
+
+The visionOS immersive shell renders the frame once per eye. CL_Frame draws too, whenever
+cl_maxfps did not throttle the tick, so per host frame the engine ran R_RenderFrame two or
+three times and eye 0 was sometimes the FIRST render and sometimes the SECOND, alternating
+at the throttle beat, while eye 1 was always the last. R_RenderFrame is not idempotent for
+dynamic lighting (glr.dlightframe advances per render, surf->dlightframe is consumed, and
+GL_PushLights re-uploads only what that render's node walk drew), so the two eyes saw
+different lighting states: flicker, worse in one eye, and a wall lit on one half.
+
+V_SuppressFrameRender(true) makes CL_Frame's SCR_UpdateScreen call site skip the draw and
+nothing else — sound, input, prediction, cinematic decode and the ref_frame accounting all
+still run. The shell wraps Qcommon_Frame in it and then renders exactly eye 0 then eye 1,
+so eye 0 is always render #1 and eye 1 always render #2. Non-VR paths never set it.
+
+Apply: patch -p1 -d vendor/q2repro < this
+--- a/src/client/view.c
++++ b/src/client/view.c
+@@ -40,6 +40,25 @@
+     return r;
+ }
+ 
++// [vr overlay 0030] Suppress CL_Frame's own SCR_UpdateScreen for the duration of one
++// Qcommon_Frame. The visionOS immersive shell needs the render COUNT per host frame to be
++// constant: CL_Frame draws whenever cl_maxfps did not throttle, so the shell's eye 0 was
++// sometimes the first R_RenderFrame of the host frame and sometimes the second, while eye 1
++// was always the last. R_RenderFrame is not idempotent for dynamic lighting, so an eye that
++// alternates position in that sequence sees a different lighting state from its partner —
++// the flicker, worse in one eye. With this set, Qcommon_Frame still runs everything else it
++// runs (sound, input, prediction, cinematic decode, the ref_frame accounting); only the draw
++// is skipped, and the shell then renders exactly eye 0 then eye 1 itself.
++static bool v_suppress_render;
++void V_SuppressFrameRender(bool suppress)
++{
++    v_suppress_render = suppress;
++}
++bool V_RenderSuppressed(void)
++{
++    return v_suppress_render;
++}
++
+ //=============
+ 
+ static cvar_t   *cl_add_particles;
+--- a/src/client/client.h
++++ b/src/client/client.h
+@@ -916,6 +916,10 @@
+ void V_Init(void);
+ void V_Shutdown(void);
+ void V_RenderView(void);
++// [vr overlay 0030] see view.c — the immersive shell suppresses CL_Frame's own draw so the
++// per-host-frame render count is constant.
++void V_SuppressFrameRender(bool suppress);
++bool V_RenderSuppressed(void);
+ void V_AddEntity(const entity_t *ent);
+ void V_AddParticle(const particle_t *p);
+ void V_AddLightEx(cl_shadow_light_t *light);
+--- a/src/client/main.c
++++ b/src/client/main.c
+@@ -3423,7 +3423,11 @@
+         if (host_speeds->integer)
+             time_before_ref = Sys_Milliseconds();
+ 
+-        SCR_UpdateScreen();
++        // [vr overlay 0030] The immersive shell renders both eyes itself, immediately after
++        // this frame returns; drawing here as well would make the host frame's render count
++        // vary with the cl_maxfps throttle. Everything else in the frame still happens.
++        if (!V_RenderSuppressed())
++            SCR_UpdateScreen();
+ 
+         if (host_speeds->integer)
+             time_after_ref = Sys_Milliseconds();

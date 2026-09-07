@@ -1,0 +1,197 @@
+R7a — the play-space split, the viewmodel mount, the VR crosshair gate, and the HUD extents.
+
+Four changes, VR-gated, all no-ops when q2vr.active is 0 (so the macOS oracle and every
+flat build are byte-identical). Each carries its own mechanism comment at the site.
+
+  * shared.h  — bodyofs/body_yaw/baseorg appended to the q2vr block.
+  * view.c    — the head's PLAY-SPACE displacement takes a yaw-only basis; only the eye's
+                head-local offset takes the finished view angles. This is the look-jitter
+                root cause (Q-VR8 item 2).
+  * entities.c— the viewmodel takes the same yaw-only play basis, so the gun stops swinging
+                around the player on every head turn.
+  * screen.c  — SCR_HudScaleChanged also re-takes the HUD EXTENTS from r_config (the wheel
+                clipping, Q-VR8 item 5), and the flat crosshair is gated off when the VR
+                world-space aim dot is the crosshair (item 3).
+
+
+--- a/inc/shared/shared.h
++++ b/inc/shared/shared.h
+@@ -1373,6 +1373,39 @@
+     int     vm_mounted;         // WRITTEN BY THE ENGINE: 1 = mounted to the hand this frame
+     float   dot_range;          // WRITTEN BY THE ENGINE: how far the aim trace reached
+     int     dot_drawn;          // WRITTEN BY THE ENGINE: 1 = the dot was actually added
++
++    // [vr overlay R7a] THE PLAY-SPACE SPLIT. APPENDED, never inserted, for the fourth time.
++    //
++    // THE BUG THIS EXISTS TO END (Q-VR8 item 2, "the images jitter in both eyes as I look
++    // left and right, slightly shaking in place"). Until now the head's own displacement rode
++    // inside `eyeofs`, and the comment above it — "head-local axes" — was true of the eye's
++    // half and FALSE of the head's. The head term comes from `baseFromWorld * deviceAnchor`,
++    // i.e. the head's position in PLAY SPACE, whose axes are fixed to the recentre yaw and do
++    // not turn when the head turns. Rotating it by the finished view angles therefore swung
++    // the camera around the play origin by the head's own yaw, pitch and roll: turn your head
++    // 30 degrees with the head 15 cm off the recentre point and the camera translates ~8 cm,
++    // in both eyes, only while the head moves. That is the jitter, and it is first-order —
++    // the compositor then reprojects pixels that do not correspond to the anchor it was
++    // given, which is why depth (`q2vrdepthfloor`) modulates its character without being its
++    // cause.
++    //
++    // The split is the fix, and it is a split of BASES, not of magnitudes:
++    //   * `eyeofs`  — this eye's offset from the head, genuinely head-local, rotated by the
++    //                 finished view angles. Unchanged in meaning; it now carries ONLY the eye.
++    //   * `bodyofs` — the head (and the hand) in play space, rotated by a YAW-ONLY basis built
++    //                 from `body_yaw` + `server_yaw`. No pitch, no roll, no head yaw: leaning
++    //                 your head does not rotate the room.
++    // `body_yaw` is the shell's own body yaw — what the stick and the recentre own — which is
++    // exactly `viewangles[YAW]` MINUS the head yaw, and is passed rather than re-derived
++    // because subtracting one angle from another to recover a third is how a port ends up with
++    // two disagreeing definitions of forward.
++    float   bodyofs[3];         // head in PLAY space (fwd, right, up), world units
++    float   body_yaw;           // play-space -> world yaw, degrees, EXCLUDING the head yaw
++    float   baseorg[3];         // WRITTEN BY THE ENGINE: the view origin BEFORE any VR offset,
++                                // written in the same block as `vieworg`. The pose-residual
++                                // instrument subtracts the two to recover what the camera
++                                // actually did. NOT for the viewmodel mount: CL_AddEntities
++                                // runs BEFORE that block, so a reader there gets last frame's.
+ } q2_vr_state_t;
+ 
+ extern q2_vr_state_t q2vr;
+--- a/src/client/view.c
++++ b/src/client/view.c
+@@ -630,6 +630,27 @@
+                            (q2vr.yaw_relative ? q2vr.server_yaw : 0.0f);
+             vrang[ROLL]  = q2vr.viewangles[ROLL];
+             AngleVectors(vrang, vrf, vrr, vru);
++            // [vr overlay R7a] TWO BASES, because there are two kinds of offset here and
++            // rotating both by the view angles is the look-jitter bug (shared.h has the
++            // mechanism in full). The head's play-space displacement takes a YAW-ONLY basis;
++            // only this eye's genuinely head-local offset takes the finished view angles.
++            //
++            // `baseorg` is captured first and is the pre-VR view origin. It exists for the
++            // pose-residual instrument, which subtracts it from the finished `vieworg` to
++            // recover what the camera actually did this frame. NOT for the viewmodel mount:
++            // CL_AddEntities runs earlier in V_RenderView than this block, so a reader there
++            // would get the PREVIOUS frame's value.
++            VectorCopy(cl.refdef.vieworg, q2vr.baseorg);
++            {
++                vec3_t pang, pf, pr, pu;
++                pang[PITCH] = 0.0f;
++                pang[YAW]   = q2vr.body_yaw + (q2vr.yaw_relative ? q2vr.server_yaw : 0.0f);
++                pang[ROLL]  = 0.0f;
++                AngleVectors(pang, pf, pr, pu);
++                VectorMA(cl.refdef.vieworg, q2vr.bodyofs[0], pf, cl.refdef.vieworg);
++                VectorMA(cl.refdef.vieworg, q2vr.bodyofs[1], pr, cl.refdef.vieworg);
++                VectorMA(cl.refdef.vieworg, q2vr.bodyofs[2], pu, cl.refdef.vieworg);
++            }
+             VectorMA(cl.refdef.vieworg, q2vr.eyeofs[0], vrf, cl.refdef.vieworg);
+             VectorMA(cl.refdef.vieworg, q2vr.eyeofs[1], vrr, cl.refdef.vieworg);
+             VectorMA(cl.refdef.vieworg, q2vr.eyeofs[2], vru, cl.refdef.vieworg);
+--- a/src/client/entities.c
++++ b/src/client/entities.c
+@@ -1316,19 +1316,38 @@
+     // fix by subtracting an anchor before the multiply. One point does both jobs here.
+     q2vr.vm_mounted = 0;
+     if (q2vr.active && q2vr.hand_valid) {
+-        vec3_t vrang, vf, vr, vu, hf, hr, hu;
++        vec3_t hf, hr, hu;
+         float sy = q2vr.yaw_relative ? cl.frame.ps.pmove.delta_angles[YAW] : 0.0f;
+-
+-        vrang[PITCH] = q2vr.viewangles[PITCH];
+-        vrang[YAW]   = q2vr.viewangles[YAW] + sy;
+-        vrang[ROLL]  = q2vr.viewangles[ROLL];
+-        AngleVectors(vrang, vf, vr, vu);
+ 
+-        VectorCopy(cl.refdef.vieworg, gun.origin);
+-        gun.origin[2] += q2vr.rise_applied;
+-        VectorMA(gun.origin, q2vr.hand_ofs[0], vf, gun.origin);
+-        VectorMA(gun.origin, q2vr.hand_ofs[1], vr, gun.origin);
+-        VectorMA(gun.origin, q2vr.hand_ofs[2], vu, gun.origin);
++        // [vr overlay R7a] THE HAND IS IN PLAY SPACE TOO, and it had the same defect the head
++        // had (shared.h): `hand_ofs` is measured from the play-space origin, whose axes are
++        // pinned to the recentre yaw, and it was rotated by the FINISHED VIEW ANGLES. So the
++        // gun swung around the player every time they turned their head — the viewmodel half
++        // of Q-VR8 item 2, and part of why the hand rig reads as mis-placed.
++        //
++        // The basis is now yaw-only, built from the shell's body yaw plus the server's own
++        // re-orientation: exactly the basis view.c gives the head, so the hand keeps its
++        // relationship to the eyes by construction rather than by two derivations agreeing.
++        //
++        // The ORIGIN is unchanged and deliberately so. `cl.refdef.vieworg` here is the
++        // pre-VR game origin — CL_AddEntities runs BEFORE view.c's injection block — so
++        // mounting off it is correct, and mounting off `q2vr.baseorg` (which the injection
++        // block writes afterwards) would silently use the PREVIOUS frame's value.
++        //
++        // The grip offset below is unchanged too: it is a property of how a fist holds a
++        // model and rightly rides the HAND's own axes.
++        {
++            vec3_t pang, pf, pr, pu;
++            pang[PITCH] = 0.0f;
++            pang[YAW]   = q2vr.body_yaw + sy;
++            pang[ROLL]  = 0.0f;
++            AngleVectors(pang, pf, pr, pu);
++            VectorCopy(cl.refdef.vieworg, gun.origin);
++            gun.origin[2] += q2vr.rise_applied;
++            VectorMA(gun.origin, q2vr.hand_ofs[0], pf, gun.origin);
++            VectorMA(gun.origin, q2vr.hand_ofs[1], pr, gun.origin);
++            VectorMA(gun.origin, q2vr.hand_ofs[2], pu, gun.origin);
++        }
+ 
+         gun.angles[PITCH] = q2vr.hand_ang[PITCH];
+         gun.angles[YAW]   = q2vr.hand_ang[YAW] + sy;
+--- a/src/client/screen.c
++++ b/src/client/screen.c
+@@ -1218,6 +1218,24 @@
+ {
+     if (scr.initialized)
+         scr.hud_scale = R_ClampScale(scr_scale);
++    // [ios port overlay R7a] AND THE EXTENTS, which 0026 left behind — the defect that
++    // clipped the weapon wheel into the top-right quadrant (Q-VR8 item 5).
++    //
++    // `scr.hud_width/height` are written in exactly two places, and the one that matters
++    // (SCR_DrawActive) runs BEFORE this bracket, from the EYE r_config. R_ModeChanged then
++    // moves r_config to the 16:9 sub-rect and R_SetScale builds the ortho from the NEW one,
++    // while SCR_Draw2D scales the OLD numbers in place. So every layout that reads these two
++    // was composed for a viewport 1824/1080 ≈ 1.69x taller than the one it was drawn into:
++    // the wheel's centre landed at 84% down instead of 50%, its `real_hud_height` picked an
++    // integer size step against a height 1.69x too large, and its cursor went off the bottom
++    // edge entirely. The crosshair, the hit marker and cgame's own hud_rect share the space
++    // and were pushed down by the same factor.
++    //
++    // R5-1 could not see it: it asserts the reported rect is 16:9 and that the content
++    // bounding box is wider than tall, and a layout that overflows the BOTTOM still gives a
++    // wide bbox. R7a's wheel case asserts the drawn centre instead.
++    scr.hud_width  = r_config.width;
++    scr.hud_height = r_config.height;
+ }
+ 
+ void SCR_ModeChanged(void)
+@@ -1988,6 +2006,29 @@
+     color_t crosshair_color = scr.crosshair_color;
+     crosshair_color.a = (crosshair_color.a * base_color.a) / 255;
+ 
++    // [vr overlay R7a] IN VR THE CROSSHAIR IS A THING IN THE WORLD, not a decal on a screen.
++    // The gun points where the hand points, but this pic is nailed to the centre of a
++    // head-locked HUD, so it told the player their shot was going somewhere it was not
++    // (Q-VR8 item 3). CL_VR_AddAimDot already draws the real one: a world particle at the
++    // hand ray's trace depth, which converges at the right distance and moves with the hand.
++    //
++    // A GATE, not a cvar write: `crosshair` is CVAR_ARCHIVE, so turning it off for VR would
++    // reach into the player's config and follow them back to the flat game.
++    //
++    // AND THE GATE IS `dot_drawn`, NOT THE DOT'S PRECONDITIONS. It was written as
++    // `aim_dot && hand_valid` — re-deriving what CL_VR_AddAimDot would decide — and that is a
++    // second copy of a predicate the first copy is allowed to fail: the dot also bails with no
++    // `cl.bsp` (a loading frame) and on a trace that comes back startsolid or allsolid (a hand
++    // pointed into geometry a few units away, which is an ordinary thing to do in a corridor).
++    // In every one of those states the preconditions said "the dot has this" and the dot had
++    // drawn nothing, so BOTH reticles were absent and the player was aiming at nothing at all.
++    // `dot_drawn` is the identity the dot writes about ITSELF, from CL_AddEntities, which runs
++    // before SCR_Draw2D in the same frame — so the flat crosshair is suppressed exactly when
++    // and only when something replaced it. A gamepad session in VR, which has no hand ray and
++    // therefore never sets it, keeps this one — the property the old predicate was reaching
++    // for, now obtained rather than re-derived. Everything else this function draws (POIs, the
++    // hit marker, damage displays) is unaffected.
++    if (!(q2vr.active && q2vr.dot_drawn))
+     R_DrawStretchPic(x + ch_x->integer,
+                      y + ch_y->integer,
+                      scr.crosshair_width,

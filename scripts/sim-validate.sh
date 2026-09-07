@@ -6,15 +6,17 @@
 #
 #   scripts/sim-validate.sh
 #
-# Sim: "q2repro-air" (iPhone Air, iOS 27.0), UDID below — created for THIS repo.
-# Never boot the HarbourMasters sessions' sims (36079716-…, 5B40BEAC-…).
+# Sim: the PROGRAM-SHARED "iPhone Air" (iOS 27.0), lane 2 of ~/dev/CLAUDE.md's lane
+# table. The old per-repo "q2repro-air" device is gone (per-project simulators were
+# purged program-wide: each carries its own data/ dir and they reached 179 GB).
+# Never create a device; never boot another session's lane.
 #
 # Prereqs (each one command): scripts/build-angle-ios.sh simulator (staged to
 # spikes/angle-prebuilt-ios-sim), scripts/build-ffmpeg-ios.sh simulator,
 # scripts/build-curl-ios.sh simulator.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-UDID="713AEF82-796C-4E9C-8A97-70722ECCA2E6"
+UDID="45A5059C-8751-4FC5-9BB2-A3EF6FFCCC22"
 BUNDLE=com.rebelancap.q2repro
 DERIVED="$ROOT/build-ios-sim"
 OUTDIR="$ROOT/artifacts/sim"
@@ -26,7 +28,20 @@ restore_ios_project() {
   ( cd "$ROOT/app" && xcodegen generate >/dev/null 2>&1 ) || true
   echo "== restored default iOS project =="
 }
-trap restore_ios_project EXIT
+# The trap OWNS the exit status (PASSED / FAILED / INTERRUPTED) — see
+# scripts/lib/suite-trap.sh. It also runs the cleanup hook below on EVERY path.
+SUITE_NAME="sim-validate-ios"
+. "$ROOT/scripts/lib/suite-trap.sh"
+suite_cleanup_hook() {
+  restore_ios_project
+  # Lane discipline, always — pass, fail, or signal. OWN_LANE guards the polite case:
+  # a run that reused a device another session had booted must not shut it down.
+  if [ "${OWN_LANE:-0}" = 1 ]; then
+    xcrun simctl terminate "$UDID" "$BUNDLE" 2>/dev/null || true
+    xcrun simctl shutdown "$UDID" 2>/dev/null || true
+    echo "== released iOS lane $UDID =="
+  fi
+}
 
 echo "== generate simulator-retargeted project =="
 Q2_ANGLE=1 Q2_SIM=1 "$ROOT/scripts/gen-app-project.sh"
@@ -44,7 +59,13 @@ APP="$(find "$DERIVED/Build/Products" -name 'q2repro.app' -path '*iphonesimulato
 echo "built: $APP"
 
 echo "== boot sim + install =="
-xcrun simctl bootstatus "$UDID" -b
+if xcrun simctl list devices booted | grep -q "$UDID"; then
+  echo "NOTE: $UDID already booted — reusing it, and NOT shutting it down at the end."
+else
+  sim_wait_shutdown "$UDID" || die "$UDID never reached state=Shutdown"
+  xcrun simctl bootstatus "$UDID" -b
+  OWN_LANE=1
+fi
 xcrun simctl terminate "$UDID" "$BUNDLE" 2>/dev/null || true
 xcrun simctl install "$UDID" "$APP"
 
@@ -75,5 +96,20 @@ for t in 10 75 180 230; do
   echo "captured $shot ($(stat -f %z "$shot") bytes)"
 done
 xcrun simctl terminate "$UDID" "$BUNDLE" 2>/dev/null || true
+
+# CONTENT IS THE PROOF, and now it is ASSERTED rather than left for a human to squint at.
+# This script used to exit 0 whatever the screenshots contained — a green run for a build
+# that rendered nothing. Each capture must carry real pixels; the threshold is a small
+# fraction of the frame so it survives a different moment in the timeline, and it measures
+# a PREDICATE over the stored (sRGB) pixel rather than an intended colour.
+echo "-- verdict: assert the captures carry content --"
+for shot in "$OUTDIR"/sim-"$GITREV"-*.png; do
+  [ -f "$shot" ] || { fail "no screenshot captured"; break; }
+  if "$ROOT/scripts/sim-pixel-count.py" "$shot" --pred nonblack --min 20000 >/dev/null; then
+    pass "content in $(basename "$shot")"
+  else
+    fail "$(basename "$shot") is (near) black — the app rendered nothing"
+  fi
+done
 echo ""
-echo "DONE — review the screenshots in $OUTDIR (content, not logs, is the proof)."
+echo "Screenshots: $OUTDIR. No explicit exit — the EXIT trap owns the verdict."

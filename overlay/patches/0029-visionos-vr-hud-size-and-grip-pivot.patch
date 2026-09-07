@@ -1,0 +1,127 @@
+Subject: [overlay 0029] VR HUD Size, and the weapon's scale pivot re-anchored to the fist
+
+The second headset verdict, items 8 and 9. Three additive seams, all inert on
+desktop (no caller outside the visionOS shell), all under the q2vr gate:
+
+  * shared.h    — `vm_pivot`, APPENDED. The point Weapon Size scales about, written by
+                  the engine from the origin it actually gave the entity.
+  * client.h /
+    screen.c    — SCR_HudScaleChanged takes a MULTIPLIER (the HUD Size row). Its only
+                  caller is the shell's 2D-redirect bracket, which passes 1.0 outside it.
+  * entities.c  — the grip correction is multiplied by the weapon scale, so the gun's
+                  grip point is the pivot at every size instead of drifting out of the
+                  hand by (s-1)*|grip| — and the pivot is read back rather than predicted.
+
+patch -p1 -d vendor/q2repro
+
+--- a/inc/shared/shared.h
++++ b/inc/shared/shared.h
+@@ -1406,6 +1406,11 @@
+                                 // instrument subtracts the two to recover what the camera
+                                 // actually did. NOT for the viewmodel mount: CL_AddEntities
+                                 // runs BEFORE that block, so a reader there gets last frame's.
++
++    // [vr overlay R7b] APPENDED, never inserted, for the fifth time.
++    float   vm_pivot[3];        // WRITTEN BY THE ENGINE: the point Weapon Size scales ABOUT,
++                                // recovered from the origin the entity was actually given
++                                // rather than predicted from the inputs. See view.c.
+ } q2_vr_state_t;
+ 
+ extern q2_vr_state_t q2vr;
+--- a/inc/client/client.h
++++ b/inc/client/client.h
+@@ -95,7 +95,7 @@
+ void SCR_EndLoadingPlaque(void);
+ 
+ void SCR_ModeChanged(void);
+-void SCR_HudScaleChanged(void);     // [overlay 0026] HUD scale only — see screen.c
++void SCR_HudScaleChanged(float mul);   // [overlay 0026/0029] HUD scale only — see screen.c
+ void SCR_UpdateScreen(void);
+ 
+ // stats system
+--- a/src/client/screen.c
++++ b/src/client/screen.c
+@@ -1214,10 +1214,30 @@
+ // routed to a different surface entirely, so the only 2D inside the bracket is the HUD, whose
+ // layout depends on r_config and this scale and nothing else. Unused off that path — no
+ // caller on desktop, so the reference build's behaviour is byte-identical.
+-void SCR_HudScaleChanged(void)
++// [ios port overlay R7b] `mul` is the VR HUD Size row: a multiple of whatever scale the
++// engine would have chosen on its own. The second headset verdict was "HUD is WAY too
++// small", and the reason is arithmetic rather than taste — the auto scale is picked from the
++// VIEWPORT's pixel count (get_auto_scale in draw.c), and the HUD's 16:9 sub-rect of a
++// supersampled eye texture is a big viewport that subtends a small angle. A number that is
++// right for a monitor is wrong for a quad 1.75 m from your face.
++//
++// It is applied HERE and not as a transform on the finished quad, which is the road the Q3
++// port took. Its HUD is carved into three world-space bands whose source rects it cannot
++// re-lay-out, so scaling the quads was the only move available; this port composes one HUD
++// into one sub-rect, so it can re-derive the scale and have the engine LAY THE HUD OUT
++// LARGER. The difference is visible: a magnified texture on a surface that is already
++// resampled twice on its way to the eye is bigger and blurrier, and blurrier is the half
++// that a headset punishes.
++//
++// `hud_scale` is a RECIPROCAL (R_SetScale orthos `r_config.width * scale`), so a bigger HUD
++// is a SMALLER number — dividing is the multiply. Guarded, because a zero here would ortho
++// the 2D layer to nothing and take the HUD, the crosshair and centerprint with it.
++void SCR_HudScaleChanged(float mul)
+ {
++    if (mul < 0.05f)
++        mul = 1.0f;
+     if (scr.initialized)
+-        scr.hud_scale = R_ClampScale(scr_scale);
++        scr.hud_scale = R_ClampScale(scr_scale) / mul;
+     // [ios port overlay R7a] AND THE EXTENTS, which 0026 left behind — the defect that
+     // clipped the weapon wheel into the top-right quadrant (Q-VR8 item 5).
+     //
+--- a/src/client/entities.c
++++ b/src/client/entities.c
+@@ -1353,9 +1353,45 @@
+         gun.angles[YAW]   = q2vr.hand_ang[YAW] + sy;
+         gun.angles[ROLL]  = q2vr.hand_ang[ROLL];
+         AngleVectors(gun.angles, hf, hr, hu);
+-        VectorMA(gun.origin, q2vr.grip_ofs[0], hf, gun.origin);
+-        VectorMA(gun.origin, q2vr.grip_ofs[1], hr, gun.origin);
+-        VectorMA(gun.origin, q2vr.grip_ofs[2], hu, gun.origin);
++        // [vr overlay R7b] THE GRIP CORRECTION SCALES WITH THE WEAPON, and that one factor is
++        // the whole of Q-VR8 item 9's second half ("anchored so Weapon Size scaling stays
++        // location-locked; no re-tuning offsets per size").
++        //
++        // R4's comment above claims Weapon Size "comes for free, and correctly, because the
++        // renderer scales an entity about its ORIGIN and the origin is now the grip point".
++        // The first half is true; the second is not. The renderer scales about the MODEL's own
++        // local origin, and `grip_ofs` is precisely the vector that moves that local origin
++        // AWAY from the fist — it is where the model's origin has to sit for the part the hand
++        // is holding to land in the hand. Call that offset g. The model point that sits in the
++        // fist is at -g in model space, so at scale s it renders at `origin - s*R*g`; with
++        // `origin` fixed at `fist + R*g` the gun slides (s-1)*|g| out of the hand — about six
++        // units per doubling with the shipped -6 forward. The player would have had to re-dial
++        // three offsets after every drag of the size slider.
++        //
++        // Wanted: fist == origin - s*R*g for every s. Therefore origin = fist + s*R*g. One
++        // factor. The pivot is then the fist at every size, which is what makes the claim
++        // testable rather than argued.
++        //
++        // (The Q3 port reaches the same place by a far longer road — it MEASURES an anchor per
++        // frame, because its cgame hangs each weapon off a `tag_weapon` with a 20-unit spread
++        // and the model bounds vary anti-correlated with it. Here the anchor is not measured:
++        // `grip_ofs` is already the answer to exactly the question that search is asking.)
++        {
++            const float gs = (q2vr.weapon_scale > 0.05f) ? q2vr.weapon_scale : 1.0f;
++            VectorMA(gun.origin, q2vr.grip_ofs[0] * gs, hf, gun.origin);
++            VectorMA(gun.origin, q2vr.grip_ofs[1] * gs, hr, gun.origin);
++            VectorMA(gun.origin, q2vr.grip_ofs[2] * gs, hu, gun.origin);
++
++            // READ BACK OFF THE FINISHED MOUNT, never predicted from the inputs: subtract the
++            // scaled correction from the origin the entity is ACTUALLY being given. A build
++            // that scaled about the wrong point then reports a pivot that MOVES with the size
++            // slider, and the assertion is simply "this does not move". Recomputing it from
++            // `hand_ofs` would restate the arithmetic under test and pass either way.
++            VectorCopy(gun.origin, q2vr.vm_pivot);
++            VectorMA(q2vr.vm_pivot, -q2vr.grip_ofs[0] * gs, hf, q2vr.vm_pivot);
++            VectorMA(q2vr.vm_pivot, -q2vr.grip_ofs[1] * gs, hr, q2vr.vm_pivot);
++            VectorMA(q2vr.vm_pivot, -q2vr.grip_ofs[2] * gs, hu, q2vr.vm_pivot);
++        }
+ 
+         VectorCopy(gun.origin, gun.oldorigin);      // re-taken: the origin moved under it
+         if (q2vr.weapon_scale > 0.05f && q2vr.weapon_scale != 1.0f)

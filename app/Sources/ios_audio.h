@@ -26,3 +26,16 @@ void Q2_iOS_AudioBoot(void);
 void Q2_iOS_AudioApply(void);
 // Per-frame: polls "is another app playing" at 4 Hz and ramps the engine mix gain.
 void Q2_iOS_AudioTick(void);
+
+// visionOS sound-stage anchoring. Q2_iOS_AudioApply() re-sets the session CATEGORY from
+// six places (driver init, foreground re-activate, four notification observers, the 4 Hz
+// drift poll, the settings picker) and in STOP_OTHERS mode bounces setActive — every one
+// of which can drop the intended spatial experience. So the DESIRED mode is stored here
+// and re-asserted at the end of every Apply, instead of being set once from the shell.
+typedef enum {
+    Q2_SPATIAL_AUTOMATIC = 0,   // 2D window: head-tracked, automatic anchoring
+    Q2_SPATIAL_FRONT     = 1,   // 3D panel: head-tracked, anchored FRONT (at the screen)
+    Q2_SPATIAL_BYPASSED  = 2,   // VR: bypass the spatializer entirely (charter D8)
+} Q2SpatialMode;
+void Q2_iOS_SetSpatialMode(int mode);   // record + apply now
+int  Q2_iOS_SpatialMode(void);          // what is currently asked for (for SETTINGSNOW)

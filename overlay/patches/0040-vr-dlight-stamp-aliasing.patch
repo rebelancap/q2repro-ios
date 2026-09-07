@@ -1,0 +1,224 @@
+Subject: [overlay 0040] the dlight stamp must name ONE pass — the per-eye lighting split
+
+R14c measured the flicker in pixels for the first time: with rerelease data on base1 in VR,
+the two eyes of ONE published pair disagree about LIGHTING on 100 % of stationary frames
+(mean-luma delta 2.69 against a 0.10 threshold; the signed difference image shows a whole
+wall filled solid). Left eye brighter in 69 of 70. Cleared by cl_shadowlights 0 / gl_dynamic 0
+/ gl_per_pixel_lighting 0; q2vripd 0 gives byte-identical eyes.
+
+R15 instrumented it (the instrument is kept below, `gl_lightdiag 1`) and the numbers name the
+mechanism exactly. On base1, per host frame:
+
+  LIGHTALIAS eye=0 nextdf=1490 prestamped=33      <-- must be 0
+  LIGHTDIAG  eye=0 n=19 lh=783e21f5 marked=12860 bh=f7db4e4e
+  LIGHTALIAS eye=1 nextdf=1490 prestamped=12837
+  LIGHTDIAG  eye=1 n=19 lh=783e21f5 marked=12837 bh=3b11653c
+
+NOT the 64-light cap. `lh`, an order-independent hash of the admitted dlight list, is
+IDENTICAL between the eyes, and n=19 — the cap is not even reached. It could not have been
+per-eye: CL_AddEntities calls CL_CalcViewValues first, which resets cl.refdef.vieworg to the
+GAME origin, and V_AddLightEx's distance fade reads that — the eye offset is applied later in
+V_RenderView. Overlay 0039's priority eviction is untouched and still correct.
+
+It is the STAMP. glr.dlightframe is supposed to name one render pass, and tess.c's gate
+(0039) trusts it. But the counter advances by only +1 per HOST frame — 0031 rewinds the
+repeat render to dlightframe_base, and 0039 restores the world's stamp after each inline
+bmodel — while every pass CONSUMES two distinct values: base+1 for the world, base+2 for
+every bmodel. So frame N's bmodel stamp IS frame N+1's world stamp. Faces the previous
+frame's bmodel pass stamped therefore read as freshly marked by this frame's world pass; they
+belong to a submodel's nodes, so the world node walk never re-visits them to clear the bits,
+and they carry the previous pass's dlightbits straight through the gate. `prestamped=33` is
+those faces, and eye 0's marked count is exactly eye 1's plus that leak (12860 = 12837 + 23).
+
+That asymmetry is the whole artefact: the FIRST eye sees the leaked faces lit, then its own
+bmodel pass re-stamps them out of range, so the SECOND eye sees them unlit. A set of surfaces
+lit in one eye only is binocular rivalry — it reads as a flash, and as the head starts and
+stops the admitted set changes, which is the seven-round "walls switching light/dark" report.
+
+Fix: track the high-water mark of the counter and start each non-repeat render from it, so a
+new stamp is strictly greater than every stamp any face carries. Three lines plus the
+bookkeeping. 0031's rewind still works (the repeat render reuses base+1/base+2 exactly, so
+GL_MarkLights re-marks idempotently); 0039's gate now means what it says.
+
+Upstream defect, upstreamable as-is and nothing stereo about it: a flat desktop carries the
+same one-frame-late bmodel bits into its world pass, it just has no second eye to disagree
+with. The 2D iOS build takes the identical path (repeat_frame is never set there).
+
+Also kept: `gl_lightdiag` (default 0), the cvar-gated instrument above — LIGHTALIAS asserts
+the prestamped==0 invariant, LIGHTDIAG separates a per-eye light SELECTION difference from a
+per-eye MARKING difference. It is the only way to see this class of defect without a pixel
+harness.
+
+Apply: patch -p1 -d vendor/q2repro < this
+--- a/src/refresh/gl.h
++++ b/src/refresh/gl.h
+@@ -144,6 +144,17 @@
+     // started; repeat_frame marks the second one, which rewinds to it so GL_MarkLights
+     // re-marks with the stamps the surfaces already carry instead of invalidating them.
+     unsigned        dlightframe_base;
++    // [vr overlay 0040] THE HIGH-WATER MARK OF THE STAMP COUNTER, which is what makes the
++    // stamp unique again. dlightframe advances by only +1 per HOST frame (0031 rewinds the
++    // repeat render to dlightframe_base, and 0039 restores the world's stamp after each
++    // inline bmodel), while every render pass CONSUMES two distinct values: base+1 for the
++    // world and base+2 for every bmodel. So frame N's bmodel stamp equals frame N+1's world
++    // stamp, and a face the previous frame's bmodel pass stamped is read as freshly marked
++    // by this frame's world pass. R_RenderFrame starts each non-repeat render from this
++    // instead of from dlightframe, so a new stamp is strictly greater than every stamp any
++    // face carries. Measured on base1: 33 faces already carried the stamp eye 0 was about to
++    // use (artifacts/vr-r14c/after/).
++    unsigned        dlightframe_high;
+     bool            repeat_frame;
+     int             viewcluster1;
+     int             viewcluster2;
+@@ -262,6 +273,8 @@
+ extern cvar_t *gl_lightmap_bits;
+ extern cvar_t *gl_brightness;
+ extern cvar_t *gl_dynamic;
++// [vr overlay 0040] cvar-gated lighting-divergence instrument (see GL_LightDiag, world.c)
++extern cvar_t *gl_lightdiag;
+ extern cvar_t *gl_dlight_falloff;
+ extern cvar_t *gl_modulate_entities;
+ extern cvar_t *gl_glowmap_intensity;
+--- a/src/refresh/main.c
++++ b/src/refresh/main.c
+@@ -47,6 +47,7 @@
+ cvar_t *gl_lightmap_bits;
+ cvar_t *gl_brightness;
+ cvar_t *gl_dynamic;
++cvar_t *gl_lightdiag;    // [vr overlay 0040]
+ cvar_t *gl_dlight_falloff;
+ cvar_t *gl_modulate_entities;
+ cvar_t *gl_glowmap_intensity;
+@@ -912,10 +913,25 @@
+     // first eye did not draw are still pushed by the second (GL_PushLights' style cache is
+     // per-surface and only the render that actually drew a surface consumes it), and faces
+     // both eyes draw are pushed twice with identical content.
+-    if (glr.repeat_frame)
++    if (glr.repeat_frame) {
+         glr.dlightframe = glr.dlightframe_base;
+-    else
++    } else {
++        // [vr overlay 0040] START FROM THE HIGH-WATER MARK, NOT FROM THE LAST VALUE. See
++        // gl.h: the counter advances +1 per host frame but each pass consumes two values, so
++        // frame N's bmodel stamp aliases frame N+1's world stamp. The aliased faces are not
++        // re-visited by the world node walk (they belong to a submodel's nodes), so they keep
++        // the PREVIOUS pass's dlightbits and sail through 0039's stamp gate in tess.c — and
++        // only in the FIRST eye, because that eye's own bmodel pass then re-stamps them out
++        // of range for the second. That is a set of faces lit in one eye and not the other,
++        // which is exactly the measured per-eye lighting split (left eye brighter, 69/70).
++        // Starting each host frame above every stamp in use restores the invariant 0039's
++        // gate assumes: a stamp names ONE pass. Upstream defect, upstreamable as-is — a flat
++        // desktop has the same one-frame-late bmodel bits, it just has no second eye to
++        // disagree with.
++        if (glr.dlightframe < glr.dlightframe_high)
++            glr.dlightframe = glr.dlightframe_high;
+         glr.dlightframe_base = glr.dlightframe;
++    }
+ 
+     // [vr overlay 0033] FORCE THE PER-PIXEL-LIGHTING UBO TO RELOAD FOR THIS RENDER.
+     // GL_LoadLights reloads the dlight uniform block only when gls.dlight_bits differs from
+@@ -1232,6 +1248,8 @@
+     gl_brightness = Cvar_Get("gl_brightness", "0", 0);
+     gl_brightness->changed = gl_lightmap_changed;
+     gl_dynamic = Cvar_Get("gl_dynamic", "1", 0);
++    // [vr overlay 0040] 1 = print LIGHTALIAS/LIGHTDIAG once per world render (diagnostic only)
++    gl_lightdiag = Cvar_Get("gl_lightdiag", "0", 0);
+     gl_dynamic->changed = gl_lightmap_changed;
+     gl_dlight_falloff = Cvar_Get("gl_dlight_falloff", "1", 0);
+     gl_modulate_entities = Cvar_Get("gl_modulate_entities", "1", 0);
+--- a/src/refresh/world.c
++++ b/src/refresh/world.c
+@@ -248,20 +248,83 @@
+ 
+         GL_MarkLights_r(node->children[0], light, lightbit);
+         node = node->children[1];
++    }
++}
++
++// [vr overlay 0040] THE INSTRUMENT THAT CLOSED THE CASE, kept because it is the only way to
++// see this class of defect without a pixel harness. `gl_lightdiag 1` prints, once per world
++// render:
++//   LIGHTALIAS prestamped — how many faces ALREADY carry the stamp this render is about to
++//     use. The invariant is 0. Non-zero means the counter has wrapped onto a stamp a previous
++//     pass wrote and those faces smuggle that pass's dlightbits through the gate in tess.c.
++//   LIGHTDIAG lh — an ORDER-INDEPENDENT hash of the admitted dlight list, which separates a
++//     per-eye SELECTION difference (the 64-of-143 cap) from a per-eye MARKING difference.
++//   LIGHTDIAG bh/marked — the same for every world face's dlightbits after GL_MarkLights.
++// Identical lh with differing bh is the marking side; that is what base1 measured.
++static void GL_LightDiag(void)
++{
++    const bsp_t *bsp = gl_static.world.cache;
++    uint32_t lh = 0, bh = 0;
++    int marked = 0, i;
++
++    for (i = 0; i < glr.fd.num_dlights; i++) {
++        const dlight_t *dl = &glr.fd.dlights[i];
++        uint32_t h = 2166136261u;
++        h = (h * 16777619u) ^ (uint32_t)(int)(dl->origin[0] * 8.0f);
++        h = (h * 16777619u) ^ (uint32_t)(int)(dl->origin[1] * 8.0f);
++        h = (h * 16777619u) ^ (uint32_t)(int)(dl->origin[2] * 8.0f);
++        h = (h * 16777619u) ^ (uint32_t)(int)(dl->radius);
++        lh += h;    // commutative, so admission ORDER cannot change the hash
++    }
++
++    for (i = 0; i < bsp->numfaces; i++) {
++        const mface_t *f = &bsp->faces[i];
++        uint32_t h;
++        if (f->dlightframe != glr.dlightframe)
++            continue;
++        marked++;
++        h = 2166136261u ^ (uint32_t)i;
++        h = (h * 16777619u) ^ (uint32_t)(f->dlightbits & 0xffffffffu);
++        h = (h * 16777619u) ^ (uint32_t)(f->dlightbits >> 32);
++        bh += h;
+     }
++
++    Com_Printf("LIGHTDIAG eye=%d rep=%d n=%d lh=%08x marked=%d bh=%08x org=%.2f,%.2f,%.2f\n",
++               q2vr.active ? q2vr.eye : -1, glr.repeat_frame ? 1 : 0,
++               glr.fd.num_dlights, lh, marked, bh,
++               glr.fd.vieworg[0], glr.fd.vieworg[1], glr.fd.vieworg[2]);
+ }
+ 
+ static void GL_MarkLights(void)
+ {
+     int i;
+     dlight_t *light;
++
++    // [vr overlay 0040] The stamp about to be used must belong to no other pass. Assert it
++    // when asked (see GL_LightDiag) — this is the number that identified the defect.
++    if (gl_lightdiag->integer) {
++        const bsp_t *b = gl_static.world.cache;
++        int alias = 0, j;
++        for (j = 0; j < b->numfaces; j++)
++            if (b->faces[j].dlightframe == glr.dlightframe + 1)
++                alias++;
++        Com_Printf("LIGHTALIAS eye=%d rep=%d nextdf=%u prestamped=%d\n",
++                   q2vr.active ? q2vr.eye : -1, glr.repeat_frame ? 1 : 0,
++                   glr.dlightframe + 1, alias);
++    }
+ 
+     glr.dlightframe++;
++    // [vr overlay 0040] every issue of a stamp raises the high-water mark (see gl.h)
++    if (glr.dlightframe > glr.dlightframe_high)
++        glr.dlightframe_high = glr.dlightframe;
+ 
+     for (i = 0, light = glr.fd.dlights; i < glr.fd.num_dlights; i++, light++) {
+         VectorCopy(light->origin, light->transformed);
+         GL_MarkLights_r(gl_static.world.cache->nodes, light, BIT_ULL(i));
+     }
++
++    if (gl_lightdiag->integer)
++        GL_LightDiag();
+ }
+ 
+ static void GL_TransformLights(const mmodel_t *model)
+@@ -271,6 +334,9 @@
+     vec3_t temp;
+ 
+     glr.dlightframe++;
++    // [vr overlay 0040] this stamp counts too — it is the one that aliased (see gl.h)
++    if (glr.dlightframe > glr.dlightframe_high)
++        glr.dlightframe_high = glr.dlightframe;
+ 
+     for (i = 0, light = glr.fd.dlights; i < glr.fd.num_dlights; i++, light++) {
+         VectorSubtract(light->origin, glr.ent->origin, temp);

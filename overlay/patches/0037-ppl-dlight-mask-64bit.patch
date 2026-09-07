@@ -1,0 +1,82 @@
+vr overlay 0037 — the 64-light mask: BIT_ULL, and a light list that belongs to its own batch
+
+The reported artefact: walls and floors switch lighter/darker as the player moves,
+sometimes in one eye only. Device-confirmed on 1.0.11.14 (base1, rerelease data):
+`gl_dynamic 0` stops it; `gl_dynamic 1` + `gl_per_pixel_lighting 0` also stops it — so
+it is the per-pixel light path, and neither the lightmap side nor lightstyles.
+
+M1. `glr.ppl_dlight_bits` is `uint64_t` and MAX_DLIGHTS is 64, but two sites build and
+test it with `1 << n` on an `int`. n == 31 yields INT_MIN, which sign-extends on the
+conversion to uint64_t and admits light 31 whenever ANY of bits 31..63 is set; n >= 32
+shifts past the width of int (undefined, and arm64's 32-bit LSL wraps the count mod 32),
+so light 32 is gated by bit 0, light 33 by bit 1, ... light 63 by bit 31. The marking
+side is already correct 64-bit (`world.c` BIT_ULL), so these two are the only places the
+top half of the mask is lost.
+
+Why it moves with the head: a world batch's bits are the union of its faces' dlightbits,
+and batch composition is a function of the view. Move, and the union's LOW bits change —
+which admits or drops a HIGH light that has nothing to do with them. A wall light
+vanishes, the wall steps darker, and steps back when the batch changes again. The two
+eyes have different frusta, so the same argument makes it one-eye-only.
+
+Why the simulator cannot reproduce it: original-baseq2 carries no shadowlight
+configstrings, so num_dlights stays at 0-3 and n never reaches 31. The rerelease's
+CL_AddShadowLights appends every live shadowlight, and a base1 room passes 31 easily.
+
+M3. `glr.ppl_dlight_bits` is global and was assigned only when the batch had marked
+lights, so a batch with none carried the LAST ALIAS MODEL's light list — which
+GL_LoadLights keys its UBO upload on. Assigned unconditionally in GL_Flush3D, the value
+belongs to the batch being drawn and nothing else.
+
+Both are upstream bugs, not port-local ones, and the fix is upstreamable as-is.
+
+--- a/src/refresh/shader.c
++++ b/src/refresh/shader.c
+@@ -1032,7 +1032,15 @@
+     c.dlightsTotal += nl;
+ 
+     for (int n = 0; n < nl; n++) {
+-        if (!(glr.ppl_dlight_bits & 1 << n)) {
++        // [vr overlay 0037] BIT_ULL, not `1 << n`. glr.ppl_dlight_bits is uint64_t and
++        // MAX_DLIGHTS is 64, but `1` here is int: n == 31 makes 1 << 31 == INT_MIN, which
++        // sign-extends to 0xFFFFFFFF80000000 and admits light 31 whenever ANY of bits 31-63
++        // is set, and n >= 32 is a shift past the width of int - undefined, and on arm64 the
++        // count wraps mod 32, so light 32 is gated by bit 0, light 33 by bit 1, and so on.
++        // The marking side is already correct 64-bit (world.c BIT_ULL), so this is the one
++        // place the mask loses its top half. Upstream bug; the rerelease reaches index 31+
++        // routinely because CL_AddShadowLights appends every live shadowlight to r_dlights.
++        if (!(glr.ppl_dlight_bits & BIT_ULL(n))) {
+             c.dlightsNotUsed++;
+             continue;
+         }
+--- a/src/refresh/mesh.c
++++ b/src/refresh/mesh.c
+@@ -998,7 +998,7 @@
+             continue;
+         }
+ 
+-        glr.ppl_dlight_bits |= 1 << i;
++        glr.ppl_dlight_bits |= BIT_ULL(i);   // [vr overlay 0037] same 64-bit mask, same defect
+     }
+ }
+ 
+--- a/src/refresh/tess.c
++++ b/src/refresh/tess.c
+@@ -791,10 +791,14 @@
+                 state |= GLS_GLOWMAP_ENABLE;
+         }
+ 
+-        if (tess.dlight_bits && glr.ppl_bits) {
+-            glr.ppl_dlight_bits = tess.dlight_bits;
++        // [vr overlay 0037] ASSIGNED UNCONDITIONALLY. glr.ppl_dlight_bits is global state:
++        // GL_DrawAliasModel rebuilds it per mesh and nothing puts the world's value back, and
++        // the old guarded assignment left a batch with no marked lights carrying the LAST
++        // MESH's light list - which GL_LoadLights then keys the UBO upload on. Assigning it
++        // here every flush makes the value belong to the batch being drawn and nothing else.
++        glr.ppl_dlight_bits = tess.dlight_bits;
++        if (tess.dlight_bits && glr.ppl_bits)
+             state |= glr.ppl_bits;
+-        }
+         array |= GLA_NORMAL;
+     }
+ 

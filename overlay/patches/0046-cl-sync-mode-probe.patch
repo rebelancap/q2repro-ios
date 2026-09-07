@@ -1,0 +1,69 @@
+Subject: [overlay 0046] CL_SyncModeProbe — what CL_Frame's throttle is ACTUALLY doing
+
+Reported in the headset on 1.0.11.24: "why is 60 our max? The M5 Vision Pro can hit 120 Hz but
+90 is more common. Can we lock the FPS to whatever refresh rate the Vision Pro is at?"
+
+Answering that needs the client's own frame-throttle state, and there is no way to read it from
+outside src/client: `sync_mode`, `main_msec`, `phys_msec`, `ref_msec` and `cls.active` are all
+file-static or private, and the shell's VR glue is a separate translation unit compiled against
+the PUBLIC headers (inc/), which is why every existing VR instrument had to be added this way.
+
+Three specific things this makes readable, each of which caps the frame rate at a value the
+shell cannot see and cannot infer:
+
+  1. `cls.active != ACT_ACTIVATED` -> CL_UpdateFrameTimes picks SYNC_SLEEP_60 ("run at 60 fps
+     if not active"), main_msec = 16, and NOTHING the shell sets on cl_maxfps changes it. In a
+     merged 2D+3D app whose 2D window is hidden while the immersive space is open, that state
+     is one scene-phase callback away at all times. This is a literal "60 is our max" and it
+     would look exactly like a renderer problem.
+  2. `cls.state != ca_active` does the same thing (loading, demo, disconnected).
+  3. cl_async: with async off, `SYNC_MAXFPS` returns from CL_Frame BEFORE prediction and
+     CL_UpdateCmd on every throttled tick, so the sim steps at cl_maxfps while the shell
+     renders a pair per pose. With async on, phys_msec/ref_msec are separate and the shell can
+     set them from the measured layer rate.
+
+Read-only, no behaviour change: one exported function that copies five values and returns the
+mode's name from a table of its own (upstream's `sync_names` is USE_DEBUG-only, and an
+instrument that compiles out of a release build is not an instrument). Nothing is cached, so a caller always sees the
+state CL_Frame will use on its very next tick.
+
+Apply: patch -p1 -d vendor/q2repro < this
+--- a/src/client/main.c
++++ b/src/client/main.c
+@@ -3260,6 +3260,36 @@
+ 
+     Com_DDPrintf("%s: mode=%s main_msec=%d ref_msec=%d, phys_msec=%d\n",
+                  __func__, sync_names[sync_mode], main_msec, ref_msec, phys_msec);
++}
++
++// [vr overlay 0046] The frame-throttle state, for a caller outside src/client (the visionOS
++// VR shell's pacing controller). Every value here is file-static or private to this
++// translation unit, and all five together are what decides how often the sim actually steps.
++// Read-only and uncached: the caller sees exactly what the next CL_Frame will use.
++//
++// The mode's name comes from a table of its own rather than `sync_names`, which only exists
++// under USE_DEBUG — an instrument that compiles out of a release build is not an instrument.
++//
++// Returns the sync mode's name (never NULL). Any out pointer may be NULL.
++const char *CL_SyncModeProbe(int *active, int *state, int *main_ms, int *phys_ms, int *ref_ms)
++{
++    static const char *const names[] = {
++        "SYNC_TIMEDEMO", "SYNC_MAXFPS", "SYNC_SLEEP_10",
++        "SYNC_SLEEP_60", "ASYNC_VIDEO", "ASYNC_FULL"
++    };
++    if (active)
++        *active = cls.active;
++    if (state)
++        *state = cls.state;
++    if (main_ms)
++        *main_ms = main_msec;
++    if (phys_ms)
++        *phys_ms = phys_msec;
++    if (ref_ms)
++        *ref_ms = ref_msec;
++    if ((unsigned)sync_mode >= q_countof(names))
++        return "SYNC_UNKNOWN";
++    return names[sync_mode];
+ }
+ 
+ void CL_AddHitMarker(void)

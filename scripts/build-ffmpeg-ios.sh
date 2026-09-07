@@ -56,7 +56,7 @@ echo "== configuring FFmpeg for iOS arm64 $BUILD_ENV (min $MIN_IOS) =="
     --disable-avdevice --disable-avfilter --disable-network \
     --disable-everything \
     --enable-demuxer=ogg,idcin,wav,flac,mp3 \
-    --enable-decoder=theora,vorbis,idcinvideo,pcm_u8,pcm_s16le,flac,mp3,opus \
+    --enable-decoder=theora,vorbis,idcin,pcm_u8,pcm_s16le,flac,mp3,opus \
     --enable-parser=vorbis \
     --enable-protocol=file \
     --disable-audiotoolbox --disable-videotoolbox \
@@ -73,6 +73,29 @@ for l in libavcodec libavformat libavutil libswresample libswscale; do
     a="$PREFIX/lib/$l.a"
     if [ ! -f "$a" ]; then echo "MISSING $a"; fail=1; continue; fi
     lipo -info "$a" | grep -q arm64 || { echo "$a not arm64"; fail=1; }
+done
+# CODEC SYMBOLS, not the configure line. `--disable-everything` makes every capability
+# opt-in BY NAME, and FFmpeg's configure does NOT fail on an unknown --enable-decoder
+# name — it records `!CONFIG_<NAME>_DECODER=yes` and builds happily without it. That is
+# how `idcinvideo` (not a real FFmpeg name; the id CIN video decoder is `idcin`) sat in
+# this script silently disabling every original-baseq2 .cin cinematic: SCR_InitCinematics
+# needs BOTH av_find_input_format("idcin") AND avcodec_find_decoder(AV_CODEC_ID_IDCIN),
+# so the whole .cin format was struck from the supported list with no diagnostic anywhere.
+#   ff_ogg_demuxer   + ff_theora_decoder → .ogv cinematics (rerelease) + ogg music
+#   ff_idcin_demuxer + ff_idcin_decoder  → .cin cinematics (original baseq2, mission packs)
+#   ff_vorbis_decoder                    → ogg music, and .ogv cinematic audio
+#   ff_pcm_u8_decoder                    → .cin cinematic audio
+# Read the symbol table ONCE into a variable. Do not pipe nm into `grep -q`: this script
+# runs under `set -o pipefail`, and `grep -q` exits the moment it matches, which SIGPIPEs
+# nm and makes the whole pipeline report failure — on the SUCCESS path, so every symbol
+# looks missing exactly when they are all present.
+SYMS="$(nm -gj "$PREFIX/lib/libavcodec.a" "$PREFIX/lib/libavformat.a" 2>/dev/null)"
+for sym in ff_ogg_demuxer ff_theora_decoder ff_vorbis_decoder \
+           ff_idcin_demuxer ff_idcin_decoder ff_pcm_u8_decoder; do
+    case $'\n'"$SYMS"$'\n' in
+        *$'\n'"_$sym"$'\n'*) ;;
+        *) echo "MISSING SYMBOL $sym — a codec name in --enable-* is wrong"; fail=1 ;;
+    esac
 done
 [ $fail -eq 0 ] || { echo "FFmpeg iOS ($BUILD_ENV) build FAILED"; exit 1; }
 echo "FFmpeg iOS ($BUILD_ENV) libs OK in $PREFIX/lib"
