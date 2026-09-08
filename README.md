@@ -3,7 +3,8 @@
 Play **Quake II** on your iPhone and Apple Vision Pro — the full campaign, both
 mission packs, the 2023 re-release content, Action Quake II, and a stereoscopic
 **3D mode** on Vision Pro that puts the game on a floating screen in your room
-with real depth.
+with real depth. Or go all the way in with **VR mode** — step inside the level,
+aim with your hands, and play the whole campaign room-scale.
 
 Built on [q2repro](https://github.com/Paril/q2repro) (Paril's Q2PRO fork with
 Quake II re-release support), rendering natively on Metal via ANGLE.
@@ -74,6 +75,10 @@ data — safe to swap data sets without losing anything.
   depth, crosshair distance, screen size/distance/height (any aspect — ultra-widescreen
   renders true widescreen FOV), surroundings dimming, and a recenter button. The 2D
   window parks as a small control card while you're in 3D.
+- **Apple Vision Pro VR mode:** the full game in immersive space — hand-tracked aiming
+  and weapon wheel, HUD floating around you (size, height and spread are adjustable),
+  snap or smooth turn, head- or hand-relative movement, controller haptics, and a
+  Render Quality slider to trade sharpness for frame rate.
 
 ## Requirements
 
