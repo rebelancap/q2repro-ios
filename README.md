@@ -18,10 +18,15 @@ Quake II re-release support), rendering natively on Metal via ANGLE.
 
 **Add the SideStore source** — the easiest path, and Quake II auto-updates when new versions ship:
 
-| Device | Source URL |
-| --- | --- |
-| iPhone / iPad | `https://raw.githubusercontent.com/rebelancap/quake-ports/main/apps-ios.json` |
-| Apple Vision Pro | `https://raw.githubusercontent.com/rebelancap/quake-ports/main/apps-visionos.json` |
+| Device | Source | Source URL |
+| --- | --- | --- |
+| iPhone / iPad | Quake ports | `https://raw.githubusercontent.com/rebelancap/quake-ports/main/apps-ios.json` |
+| iPhone / iPad | All ports | `https://raw.githubusercontent.com/rebelancap/all-ports/main/apps-ios.json` |
+| Apple Vision Pro | Quake ports | `https://raw.githubusercontent.com/rebelancap/quake-ports/main/apps-visionos.json` |
+| Apple Vision Pro | All ports | `https://raw.githubusercontent.com/rebelancap/all-ports/main/apps-visionos.json` |
+
+Quake II is in both sources — add either one (Quake ports carries just the
+Quake family; All ports carries every rebelancap port).
 
 In [SideStore](https://sidestore.io) / [AltStore](https://altstore.io): *Sources → **+** → paste the URL*, then
 install Quake II. These are shared sources — they also carry Quake (vkQuake) and Quake III.
